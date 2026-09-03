@@ -1,0 +1,43 @@
+[project]
+name = "arcus-agent-gateway"
+version = "0.1.0"
+description = "MCP gateway for AI agents to Robinhood Chain (Arcus DEX) tokenized US equities: quotes, multipliers, corporate actions, market status, sectors. Read-only, keyless."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["robinhood-chain", "arcus", "tokenized-stocks", "mcp", "ai-agents", "rwa", "defi"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Intended Audience :: Developers",
+]
+dependencies = [
+    "fastmcp>=3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mecorp/arcus-agent-gateway"
+Repository = "https://github.com/mecorp/arcus-agent-gateway"
+Issues = "https://github.com/mecorp/arcus-agent-gateway/issues"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-cov>=5", "pip-audit"]
+
+[project.scripts]
+arcus-agent-gateway = "arcus_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["arcus_mcp"]
+
+[tool.pytest.ini_options]
+markers = ["online: live API integration (run with -m online)"]
+addopts = "-m 'not online'"
