@@ -73,6 +73,18 @@ def _tradable_whole_and_fractional(a: dict) -> bool:
     return (mkt.get("whole") == TRADABLE and mkt.get("fractional") == TRADABLE)
 
 
+def _ts(v):
+    """Normalize a timestamp value: ISO strings pass through; protobuf
+    Timestamp objects ({year, month, day, ...} dicts, seen LIVE on
+    /corporate-actions effectiveTime 2026-09-03) become ISO dates."""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, dict) and isinstance(v.get("year"), int):
+        return (f"{v['year']:04d}-{v.get('month', 0):02d}"
+                f"-{v.get('day', 0):02d}")
+    return None
+
+
 def _pending_effective_time(actions: list[dict]) -> str | None:
     """First effectiveTime/processDate found in a symbol's actions."""
     for act in actions or []:
@@ -80,7 +92,7 @@ def _pending_effective_time(actions: list[dict]) -> str | None:
                     "effective_time"):
             v = act.get(key)
             if v:
-                return v
+                return _ts(v)
     return None
 
 
@@ -166,10 +178,14 @@ def quote(symbol: str) -> dict:
     sym = a.get("tokenSymbol") or ""
     p = api.prices(sym)
     m = _multiplier_block(a)["current"]
-    try:  # effective_time is best-effort; never block quotes on it
-        eff = _pending_effective_time(api.corporate_actions(sym, limit=5))
-    except (ValueError, RuntimeError):
-        eff = None
+    eff = None
+    if _f(a.get("pendingMultiplier")) is not None:  # only spend a
+        # corporate-actions call when a multiplier change is queued
+        try:
+            eff = _pending_effective_time(
+                api.corporate_actions(sym, limit=5))
+        except (ValueError, RuntimeError):
+            eff = None
     mult = _multiplier_block(a, effective_time=eff)
     out = {
         "symbol": sym,
