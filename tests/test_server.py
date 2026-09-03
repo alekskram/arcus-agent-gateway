@@ -1,0 +1,502 @@
+"""Unit tests for arcus_mcp.server tools - 100% offline.
+
+Every test monkeypatches the api module surface (api.assets / api.asset
+/ api.prices / api.corporate_actions / api.get) so no HTTP can happen;
+api.get raises loudly if anything leaks through. Data = the live
+fixtures in tests/fixtures/ (194 assets, real AAPL quote) plus synthetic
+rows for the edge cases the ТЗ demands:
+
+  SPLT  pendingMultiplier "4.0..." + SPLIT action with effectiveTime
+  HALT  quote with isTradingHalt=true
+  FRAC  fractional-untradable asset
+  NOQT  valid asset, no quote (metadata-only path)
+  INACT ASSET_STATUS_INACTIVE row
+
+Pinned MEC-53 invariants (see scripts/smoke_server_offline.py):
+  (а) bid_adjusted == round(bid_raw * multiplier, 6)
+  (б) spread_raw == ask_raw - bid_raw >= 0
+  (в) halted token: in market_status().halted (cached) + is_halted in quote()
+  (г) unknown symbol -> ValueError mentioning token_list
+  (д) quotes() with 21+ symbols -> ValueError
+  (е) quotes(): unknown -> errors, known -> quotes
+  (ж) token_detail warnings on pendingMultiplier + effectiveTime
+  (з) sector_view with cold cache: avg None + note
+  (и) search('apple') -> AAPL first
+  (й) onchain_info: v0.2 stub note
+"""
+import asyncio
+import json
+from pathlib import Path
+
+import pytest
+
+import arcus_mcp.api as api
+import arcus_mcp.server as srv
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+# ----------------------------------------------------------------- test data
+
+ASSETS = json.loads((FIXTURES / "assets.json").read_text())
+ASSETS = ASSETS.get("assets", ASSETS) if isinstance(ASSETS, dict) else ASSETS
+AAPL_QUOTE = json.loads(
+    (FIXTURES / "prices_AAPL.json").read_text())["quotes"][0]
+AAPL_ASSET = next(a for a in ASSETS if a["tokenSymbol"] == "AAPL")
+UNTRADABLE_FIXTURE = [  # WYFI/SLS/XNDU-style rows in the live snapshot
+    a["tokenSymbol"] for a in ASSETS
+    if (a.get("tradingCapabilities") or {}).get("market", {})
+    .get("fractional") != "TRADING_STATUS_TRADABLE"]
+
+
+def _clone(sym: str, **over) -> dict:
+    """Schema-true synthetic asset row (fixture row + overrides)."""
+    base = json.loads(json.dumps(ASSETS[0]))
+    base.update({"tokenSymbol": sym, "tokenName": f"{sym} • Robinhood Token",
+                 "isin": "US0000000000"})
+    base.update(over)
+    return base
+
+
+SPLT = _clone("SPLT", pendingMultiplier="4.000000000000000000")
+HALT = _clone("HALT")
+FRAC = _clone("FRAC", tradingCapabilities={
+    "market": {"whole": "TRADING_STATUS_TRADABLE",
+               "fractional": "TRADING_STATUS_UNTRADABLE"},
+    "extended": {"whole": "TRADING_STATUS_TRADABLE",
+                 "fractional": "TRADING_STATUS_TRADABLE"},
+    "overnight": {"whole": "TRADING_STATUS_UNTRADABLE",
+                  "fractional": "TRADING_STATUS_UNTRADABLE"},
+})
+NOQT = _clone("NOQT")
+INACT = _clone("INACT", status="ASSET_STATUS_INACTIVE")
+MOCK_ASSETS = ASSETS + [SPLT, HALT, FRAC, NOQT, INACT]
+
+MOCK_ACTIONS = [  # three field-name variants (API_NOTES #5)
+    {"tokenSymbol": "AAPL", "kind": "DIVIDEND", "amount": "0.25",
+     "processDate": "2026-08-11"},
+    {"tokenSymbol": "SPLT", "actionType": "SPLIT", "status": "PENDING",
+     "splitFrom": "1", "splitTo": "4",
+     "effectiveTime": "2026-11-06T00:00:00Z"},
+    {"tokenSymbol": "MSFT", "type": "SPLIT", "status": "PROCESSED",
+     "rateFrom": "2", "rateTo": "1",
+     "effectiveTime": "2026-03-27T00:00:00Z"},
+]
+
+MOCK_PRICES = {  # keyed by normalized symbol; NOQT deliberately absent
+    "AAPL": AAPL_QUOTE,
+    "HALT": {**AAPL_QUOTE, "tokenSymbol": "HALT", "bid": "9.99",
+             "ask": "10.01", "isTradingHalt": True},
+    "SPLT": {**AAPL_QUOTE, "tokenSymbol": "SPLT", "bid": "120.00",
+             "ask": "120.02", "isTradingHalt": False},
+    "FRAC": {**AAPL_QUOTE, "tokenSymbol": "FRAC", "bid": "5.00",
+             "ask": "5.02", "isTradingHalt": False},
+}
+
+
+def _norm(s: str) -> str:
+    return (s or "").strip().upper()
+
+
+# ------------------------------------------------------------------ fixtures
+
+@pytest.fixture
+def mock_api(monkeypatch):
+    """Replace the api surface the server touches; seed the price cache.
+
+    Yields the MOCK_PRICES-backed api module. Any attempt to reach
+    api.get() (live HTTP) fails the test loudly.
+    """
+    def _no_get(*a, **k):  # pragma: no cover - only on a bug
+        raise RuntimeError("live HTTP attempted in offline test!")
+
+    monkeypatch.setattr(api, "assets", lambda: MOCK_ASSETS)
+    monkeypatch.setattr(api, "asset", lambda symbol: next(
+        (a for a in MOCK_ASSETS
+         if a.get("tokenSymbol", "").upper() == _norm(symbol)), None))
+    monkeypatch.setattr(api, "prices",
+                        lambda symbol: MOCK_PRICES.get(_norm(symbol)))
+    monkeypatch.setattr(api, "corporate_actions",
+                        lambda symbol=None, limit=10: [
+                            x for x in MOCK_ACTIONS
+                            if symbol is None
+                            or x.get("tokenSymbol", "").upper()
+                            == _norm(symbol)][:limit])
+    monkeypatch.setattr(api, "get", _no_get)
+    # seed the price cache exactly like api.prices() would
+    monkeypatch.setattr(api, "_PRICES_CACHE", {
+        sym: (0.0, q) for sym, q in MOCK_PRICES.items()})
+    return api
+
+
+@pytest.fixture
+def cold_cache(mock_api, monkeypatch):
+    """mock_api but with an EMPTY price cache (fresh server start)."""
+    monkeypatch.setattr(api, "_PRICES_CACHE", {})
+    return api
+
+
+# ---------------------------------------------------------------- token_list
+
+def test_token_list_active_default_hides_inactive(mock_api):
+    tl = srv.token_list()
+    assert tl["total_matching"] == 198  # 194 live + SPLT/HALT/FRAC/NOQT
+    assert all(t["status"] == "ASSET_STATUS_ACTIVE" for t in tl["tokens"])
+    assert "INACT" not in [t["symbol"] for t in tl["tokens"]]
+
+
+def test_token_list_limit_and_count(mock_api):
+    tl = srv.token_list(limit=50)
+    assert tl["count"] == 50 and len(tl["tokens"]) == 50
+    assert tl["total_matching"] == 198
+
+
+def test_token_list_status_all_includes_inactive(mock_api):
+    tl = srv.token_list(status="ALL")
+    assert tl["total_matching"] == 199  # + INACT
+
+
+def test_token_list_row_shape_and_multiplier(mock_api):
+    tl = srv.token_list(status="ALL", limit=500)
+    row = next(t for t in tl["tokens"] if t["symbol"] == "AAPL")
+    assert set(row) == {"symbol", "name", "status", "multiplier",
+                        "tradable"}
+    assert row["multiplier"] == float(AAPL_ASSET["currentMultiplier"])
+    assert row["tradable"] is True
+
+
+def test_token_list_tradable_false_when_fractional_untradable(mock_api):
+    tl = srv.token_list()
+    row = next(t for t in tl["tokens"] if t["symbol"] == "FRAC")
+    assert row["tradable"] is False
+
+
+# -------------------------------------------------------------------- quote
+
+def test_quote_joins_fixture_price_and_metadata(mock_api):
+    q = srv.quote("aapl")  # case-insensitive
+    assert q["symbol"] == "AAPL"
+    assert q["bid_raw"] == 327.77 and q["ask_raw"] == 327.78
+    assert q["is_halted"] is False
+    assert q["generated_at"] == AAPL_QUOTE["generatedAt"]
+    assert q["daily_volume"] == 25806784
+
+
+def test_quote_invariant_adjusted_equals_raw_times_multiplier(mock_api):
+    """ТЗ (а): adjusted == round(raw * current multiplier, 6)."""
+    for sym in ("AAPL", "HALT", "SPLT", "FRAC"):
+        q = srv.quote(sym)
+        m = q["multiplier"]["current"]
+        assert q["bid_adjusted"] == round(q["bid_raw"] * m, 6), sym
+        assert q["ask_adjusted"] == round(q["ask_raw"] * m, 6), sym
+        assert q["mid_adjusted"] == round(
+            (q["bid_raw"] + q["ask_raw"]) / 2 * m, 6), sym
+
+
+def test_quote_invariant_spread_non_negative(mock_api):
+    """ТЗ (б): spread_raw == ask_raw - bid_raw, >= 0."""
+    for sym in ("AAPL", "HALT", "SPLT", "FRAC"):
+        q = srv.quote(sym)
+        assert q["spread_raw"] == round(
+            q["ask_raw"] - q["bid_raw"], 6), sym
+        assert q["spread_raw"] >= 0, sym
+
+
+def test_quote_multiplier_block_raw_and_pending(mock_api):
+    q = srv.quote("AAPL")
+    assert q["multiplier"]["current"] == float(
+        AAPL_ASSET["currentMultiplier"])
+    assert q["multiplier"]["pending"] is None  # "" -> None, never parsed
+    qs = srv.quote("SPLT")
+    assert qs["multiplier"]["pending"] == 4.0
+    assert qs["multiplier"]["effective_time"] == "2026-11-06T00:00:00Z"
+
+
+def test_quote_trading_capabilities_normalized(mock_api):
+    assert srv.quote("AAPL")["trading_capabilities"] == {
+        "fractional": True, "all_day": True, "extended_hours": True}
+
+
+def test_quote_halted_token_is_halted_true(mock_api):
+    """ТЗ (в): is_halted=true prominently (top level) in quote()."""
+    q = srv.quote("HALT")
+    assert q["is_halted"] is True
+
+
+def test_quote_no_quote_returns_metadata_with_note(mock_api):
+    q = srv.quote("NOQT")
+    assert q["symbol"] == "NOQT"
+    assert q["bid_raw"] is None and q["ask_raw"] is None
+    assert q["bid_adjusted"] is None and q["ask_adjusted"] is None
+    assert "note" in q
+
+
+def test_quote_unknown_symbol_mentions_token_list(mock_api):
+    """ТЗ (г): actionable ValueError pointing at token_list()."""
+    with pytest.raises(ValueError, match="token_list"):
+        srv.quote("NOPE")
+
+
+# ------------------------------------------------------------------- quotes
+
+def test_quotes_batch_known_and_unknown_split(mock_api):
+    """ТЗ (е): unknown -> errors, known -> quotes."""
+    out = srv.quotes(["AAPL", "MSFT", "NOPE"])
+    assert [q["symbol"] for q in out["quotes"]] == ["AAPL", "MSFT"]
+    assert len(out["errors"]) == 1
+    assert out["errors"][0]["symbol"] == "NOPE"
+    assert "token_list" in out["errors"][0]["reason"]
+
+
+def test_quotes_max_20_symbols(mock_api):
+    """ТЗ (д): 21 symbols -> ValueError telling to split the batch."""
+    with pytest.raises(ValueError, match="20"):
+        srv.quotes([f"S{i}" for i in range(21)])
+    ok = srv.quotes(["AAPL"] * 20)  # exactly 20 is allowed (dupes ok)
+    assert len(ok["quotes"]) == 20
+
+
+def test_quotes_filters_blank_symbols(mock_api):
+    out = srv.quotes(["AAPL", "", "  "])
+    assert [q["symbol"] for q in out["quotes"]] == ["AAPL"]
+
+
+def test_quotes_adjusted_invariant_holds_for_batch(mock_api):
+    out = srv.quotes(["AAPL", "HALT", "SPLT", "FRAC"])
+    for q in out["quotes"]:
+        m = q["multiplier"]["current"]
+        assert q["bid_adjusted"] == round(q["bid_raw"] * m, 6)
+        assert q["spread_raw"] >= 0
+
+
+# ------------------------------------------------------------- token_detail
+
+def test_token_detail_metadata_block(mock_api):
+    td = srv.token_detail("SPLT")
+    md = td["metadata"]
+    assert md["symbol"] == "SPLT"
+    assert md["chain_id"] == 4663  # Robinhood Chain
+    assert str(md["contract"]).startswith("0x")
+    assert md["isin"] and md["decimals"] == 18
+
+
+def test_token_detail_embeds_quote_view(mock_api):
+    td = srv.token_detail("AAPL")
+    assert td["quote"]["symbol"] == "AAPL"
+    assert td["quote"]["bid_raw"] == 327.77
+
+
+def test_token_detail_pending_split_warning(mock_api):
+    """ТЗ (ж): pendingMultiplier + effectiveTime -> warnings entry."""
+    td = srv.token_detail("SPLT")
+    assert td["multiplier"]["pending"] == 4.0
+    assert any("pending split" in w and "4.0" in w
+               and "2026-11-06" in w for w in td["warnings"]), (
+        td["warnings"])
+
+
+def test_token_detail_no_pending_no_warnings(mock_api):
+    td = srv.token_detail("AAPL")
+    assert td["multiplier"]["pending"] is None
+    assert td["warnings"] == []
+
+
+def test_token_detail_multiplier_history_note(mock_api):
+    assert isinstance(srv.token_detail("AAPL")["multiplier"]
+                      ["history_note"], str)
+
+
+def test_token_detail_corporate_actions_tolerant_mapping(mock_api):
+    td = srv.token_detail("SPLT")
+    rows = td["corporate_actions"]
+    assert len(rows) == 1
+    assert rows[0]["type"] == "SPLIT"           # actionType variant
+    assert rows[0]["details"] == {"old_rate": 1.0, "new_rate": 4.0}
+    assert "splitFrom" in rows[0]["raw"]        # original kept untouched
+
+
+def test_token_detail_raw_trading_capabilities_kept(mock_api):
+    tc = srv.token_detail("AAPL")["trading_capabilities"]
+    assert tc["raw"]["market"]["fractional"] == "TRADING_STATUS_TRADABLE"
+    assert tc["fractional"] is True
+
+
+def test_token_detail_unknown_symbol(mock_api):
+    with pytest.raises(ValueError, match="token_list"):
+        srv.token_detail("NOPE")
+
+
+# ------------------------------------------------------------ market_status
+
+def test_market_status_counts_from_assets_only(mock_api):
+    ms = srv.market_status()
+    assert ms["total_tokens"] == 199  # 194 + SPLT/HALT/FRAC/NOQT/INACT
+    assert ms["active"] == 198
+    assert ms["untradable"] == len(UNTRADABLE_FIXTURE) + 1  # + FRAC
+
+
+def test_market_status_halted_from_cached_quotes(mock_api):
+    """ТЗ (в): halted token (cached price) shows in market_status()."""
+    ms = srv.market_status()
+    assert ms["halted"] == ["HALT"]
+
+
+def test_market_status_halted_empty_when_cache_cold(cold_cache):
+    ms = srv.market_status()
+    assert ms["halted"] == []
+
+
+def test_market_status_fields_and_note(mock_api):
+    ms = srv.market_status()
+    assert ms["extended_hours_open"] is True
+    assert "tradingCapabilities" in ms["market_hours_status"]
+    assert "note" in ms and "quotes()" in ms["note"]
+
+
+# -------------------------------------------------------- corporate_actions
+
+def test_corporate_actions_all_with_count(mock_api):
+    ca = srv.corporate_actions()
+    assert ca["count"] == 3 and len(ca["actions"]) == 3
+
+
+def test_corporate_actions_field_variants_normalized(mock_api):
+    rows = srv.corporate_actions()["actions"]
+    assert [r["type"] for r in rows] == ["DIVIDEND", "SPLIT", "SPLIT"]
+    msft = next(r for r in rows if r["symbol"] == "MSFT")
+    assert msft["type"] == "SPLIT"                # `type` variant
+    assert msft["details"] == {"old_rate": 2.0, "new_rate": 1.0}
+
+
+def test_corporate_actions_symbol_filter_and_limit(mock_api):
+    ca = srv.corporate_actions(symbol="msft", limit=5)
+    assert ca["count"] == 1 and ca["actions"][0]["symbol"] == "MSFT"
+    assert srv.corporate_actions(limit=1)["count"] == 1
+
+
+# ------------------------------------------------------------------- search
+
+def test_search_apple_ranks_aapl_first(mock_api):
+    """ТЗ (и): 'apple' -> AAPL first (name-word match)."""
+    sr = srv.search("apple")
+    assert sr["results"][0]["symbol"] == "AAPL"
+    assert sr["count"] >= 1
+
+
+def test_search_exact_symbol_scores_highest(mock_api):
+    sr = srv.search("aapl")
+    assert sr["results"][0]["symbol"] == "AAPL"
+    assert sr["results"][0]["score"] == 100
+
+
+def test_search_prefix_beats_substring(mock_api):
+    assert srv.search("nv")["results"][0]["symbol"] == "NVDA"
+
+
+def test_search_rows_carry_sector_and_capped_at_10(mock_api):
+    sr = srv.search("a")
+    assert sr["count"] <= 10
+    assert all("sector" in r for r in sr["results"])
+
+
+def test_search_empty_query(mock_api):
+    assert srv.search("   ") == {"query": "   ", "results": [],
+                                 "count": 0}
+
+
+# --------------------------------------------------------------- sector_view
+
+def test_sector_view_sizes_from_static_map(mock_api):
+    sv = srv.sector_view()
+    assert len(sv["sectors"]) == 13
+    assert sv["sectors"]["Tech"]["symbols"] == 50
+
+
+def test_sector_view_averages_from_cached_quotes(mock_api):
+    sv = srv.sector_view()
+    tech = sv["sectors"]["Tech"]  # AAPL cached by the fixture
+    assert tech["quoted"] == 1
+    assert tech["avg_bid_adjusted"] is not None
+    assert tech["avg_ask_adjusted"] is not None
+    # average is multiplier-adjusted, not raw
+    aapl = srv.quote("AAPL")
+    assert tech["avg_bid_adjusted"] == aapl["bid_adjusted"]
+
+
+def test_sector_view_halted_listed_per_sector(mock_api):
+    halt_sector = srv.sector_view()["sectors"]["Other"]
+    # HALT is synthetic (not in the map) so no sector claims it;
+    # cached-halt accounting lives in market_status().halted instead.
+    assert "HALT" not in halt_sector["halted"]
+
+
+def test_sector_view_cold_cache_avg_none_with_note(cold_cache):
+    """ТЗ (з): no cached quotes -> avg None, explanatory note present."""
+    sv = srv.sector_view()
+    for name, sec in sv["sectors"].items():
+        assert sec["avg_bid_adjusted"] is None, name
+        assert sec["avg_ask_adjusted"] is None, name
+        assert sec["quoted"] == 0, name
+    assert "note" in sv and "quotes(" in sv["note"]
+
+
+def test_sector_view_never_fetches_prices(cold_cache, monkeypatch):
+    """sector_view is cache-driven: a cold cache means zero price calls."""
+    def _no_prices(symbol):
+        raise AssertionError(
+            "sector_view() must not fetch prices (cache-only by design)")
+    monkeypatch.setattr(cold_cache, "prices", _no_prices)
+    sv = srv.sector_view()  # must not raise
+    assert len(sv["sectors"]) == 13
+
+
+# --------------------------------------------------------------- onchain_info
+
+def test_onchain_info_stub_fields(mock_api):
+    """ТЗ (й): v0.2 stub - contract/chain/decimals/isin + note."""
+    oc = srv.onchain_info("AAPL")
+    aapl_dep = AAPL_ASSET["deployments"][0]
+    assert oc["symbol"] == "AAPL"
+    assert oc["contract"] == aapl_dep["contractAddress"]
+    assert oc["chain_id"] == 4663
+    assert oc["network"] == "Robinhood Chain"
+    assert oc["decimals"] == 18
+    assert oc["isin"] == AAPL_ASSET["isin"]
+    assert "v0.2" in oc["note"]
+
+
+def test_onchain_info_unknown_symbol(mock_api):
+    with pytest.raises(ValueError, match="token_list"):
+        srv.onchain_info("NOPE")
+
+
+# ---------------------------------------------------------------- MCP wire
+
+EXPECTED_TOOLS = {"token_list", "quote", "quotes", "token_detail",
+                  "market_status", "corporate_actions", "search",
+                  "sector_view", "onchain_info"}
+
+
+def test_build_server_registers_exactly_nine_readonly_tools(mock_api):
+    mcp = srv.build_server()
+    tools = asyncio.run(mcp.list_tools())
+    names = {t.name for t in tools}
+    assert names == EXPECTED_TOOLS
+
+    for t in tools:
+        ann = t.annotations or {}
+        ro = ann.get("read_only_hint") if isinstance(ann, dict) \
+            else getattr(ann, "read_only_hint", None)
+        de = ann.get("destructive_hint") if isinstance(ann, dict) \
+            else getattr(ann, "destructive_hint", None)
+        assert (ro, de) == (True, False), t.name
+
+
+def test_mcp_wire_call_quote_round_trip(mock_api):
+    mcp = srv.build_server()
+    res = asyncio.run(mcp.call_tool("quote", {"symbol": "aapl"}))
+    payload = json.loads(res.content[0].text)
+    assert payload["symbol"] == "AAPL"
+    assert payload["bid_raw"] == 327.77
+    assert payload["bid_adjusted"] == round(327.77 * payload[
+        "multiplier"]["current"], 6)
