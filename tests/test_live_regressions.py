@@ -22,6 +22,7 @@ def _load_assets():
 @pytest.fixture
 def live_aapl(monkeypatch):
     assets = _load_assets()
+    aapl = next(a for a in assets if a["tokenSymbol"] == "AAPL")
     monkeypatch.setattr(server.api, "assets", lambda: assets)
 
     def fake_asset(sym):
@@ -37,22 +38,27 @@ def live_aapl(monkeypatch):
                 "generatedAt": "2026-09-03T20:21:20.546707549Z"}
 
     monkeypatch.setattr(server.api, "prices", fake_prices)
-    return assets
+    return assets, aapl
 
 
 def test_protobuf_timestamp_normalized(live_aapl, monkeypatch):
     """effectiveTime as protobuf dict -> ISO date string in warnings."""
+    assets, aapl = live_aapl
+    aapl["pendingMultiplier"] = "4.000000000000000000"
     monkeypatch.setattr(
         server.api, "corporate_actions",
         lambda sym=None, limit=10: [{
             "tokenSymbol": "AAPL", "kind": "FORWARD_SPLIT",
             "effectiveTime": {"year": 2026, "month": 11, "day": 6},
         }])
-    detail = server.token_detail("AAPL")
-    assert any("2026-11-06" in w for w in detail["warnings"]), detail[
-        "warnings"]
-    # and through the multiplier block the time is a string, never a dict
-    assert isinstance(detail["multiplier"]["effective_time"], str)
+    try:
+        detail = server.token_detail("AAPL")
+        assert any("2026-11-06" in w for w in detail["warnings"]), detail[
+            "warnings"]
+        # and through the multiplier block the time is a string, never a dict
+        assert isinstance(detail["multiplier"]["effective_time"], str)
+    finally:
+        aapl["pendingMultiplier"] = ""
 
 
 def test_quote_skips_corporate_actions_when_no_pending(live_aapl,
@@ -75,15 +81,17 @@ def test_quote_skips_corporate_actions_when_no_pending(live_aapl,
 
 def test_quote_fetches_effective_time_when_pending(live_aapl, monkeypatch):
     """pendingMultiplier set -> effective_time resolved from actions."""
-    assets = live_aapl
-    assets[0]["pendingMultiplier"] = "4.000000000000000000"
+    assets, aapl = live_aapl
+    aapl["pendingMultiplier"] = "4.000000000000000000"
     monkeypatch.setattr(
         server.api, "corporate_actions",
         lambda sym=None, limit=10: [{
             "tokenSymbol": "AAPL", "kind": "FORWARD_SPLIT",
             "effectiveTime": {"year": 2026, "month": 11, "day": 6},
         }])
-    q = server.quote("AAPL")
-    assert q["multiplier"]["pending"] == 4.0
-    assert q["multiplier"]["effective_time"] == "2026-11-06"
-    assets[0]["pendingMultiplier"] = ""  # restore
+    try:
+        q = server.quote("AAPL")
+        assert q["multiplier"]["pending"] == 4.0
+        assert q["multiplier"]["effective_time"] == "2026-11-06"
+    finally:
+        aapl["pendingMultiplier"] = ""
