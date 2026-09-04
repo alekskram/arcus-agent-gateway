@@ -4,7 +4,7 @@ Every test monkeypatches the api module surface (api.assets / api.asset
 / api.prices / api.corporate_actions / api.get) so no HTTP can happen;
 api.get raises loudly if anything leaks through. Data = the live
 fixtures in tests/fixtures/ (194 assets, real AAPL quote) plus synthetic
-rows for the edge cases the ТЗ demands:
+rows for the edge cases the spec demands:
 
   SPLT  pendingMultiplier "4.0..." + SPLIT action with effectiveTime
   HALT  quote with isTradingHalt=true
@@ -12,17 +12,17 @@ rows for the edge cases the ТЗ demands:
   NOQT  valid asset, no quote (metadata-only path)
   INACT ASSET_STATUS_INACTIVE row
 
-Pinned MEC-53 invariants (see scripts/smoke_server_offline.py):
-  (а) bid_adjusted == round(bid_raw * multiplier, 6)
-  (б) spread_raw == ask_raw - bid_raw >= 0
-  (в) halted token: in market_status().halted (cached) + is_halted in quote()
-  (г) unknown symbol -> ValueError mentioning token_list
-  (д) quotes() with 21+ symbols -> ValueError
-  (е) quotes(): unknown -> errors, known -> quotes
-  (ж) token_detail warnings on pendingMultiplier + effectiveTime
-  (з) sector_view with cold cache: avg None + note
-  (и) search('apple') -> AAPL first
-  (й) onchain_info: v0.2 stub note
+Pinned spec invariants (see scripts/smoke_server_offline.py):
+  (a) bid_adjusted == round(bid_raw * multiplier, 6)
+  (b) spread_raw == ask_raw - bid_raw >= 0
+  (c) halted token: in market_status().halted (cached) + is_halted in quote()
+  (d) unknown symbol -> ValueError mentioning token_list
+  (e) quotes() with 21+ symbols -> ValueError
+  (f) quotes(): unknown -> errors, known -> quotes
+  (g) token_detail warnings on pendingMultiplier + effectiveTime
+  (h) sector_view with cold cache: avg None + note
+  (i) search('apple') -> AAPL first
+  (j) onchain_info: v0.2 stub note
 """
 import asyncio
 import json
@@ -183,7 +183,7 @@ def test_quote_joins_fixture_price_and_metadata(mock_api):
 
 
 def test_quote_invariant_adjusted_equals_raw_times_multiplier(mock_api):
-    """ТЗ (а): adjusted == round(raw * current multiplier, 6)."""
+    """Spec (a): adjusted == round(raw * current multiplier, 6)."""
     for sym in ("AAPL", "HALT", "SPLT", "FRAC"):
         q = srv.quote(sym)
         m = q["multiplier"]["current"]
@@ -194,7 +194,7 @@ def test_quote_invariant_adjusted_equals_raw_times_multiplier(mock_api):
 
 
 def test_quote_invariant_spread_non_negative(mock_api):
-    """ТЗ (б): spread_raw == ask_raw - bid_raw, >= 0."""
+    """Spec (b): spread_raw == ask_raw - bid_raw, >= 0."""
     for sym in ("AAPL", "HALT", "SPLT", "FRAC"):
         q = srv.quote(sym)
         assert q["spread_raw"] == round(
@@ -218,7 +218,7 @@ def test_quote_trading_capabilities_normalized(mock_api):
 
 
 def test_quote_halted_token_is_halted_true(mock_api):
-    """ТЗ (в): is_halted=true prominently (top level) in quote()."""
+    """Spec (c): is_halted=true prominently (top level) in quote()."""
     q = srv.quote("HALT")
     assert q["is_halted"] is True
 
@@ -232,7 +232,7 @@ def test_quote_no_quote_returns_metadata_with_note(mock_api):
 
 
 def test_quote_unknown_symbol_mentions_token_list(mock_api):
-    """ТЗ (г): actionable ValueError pointing at token_list()."""
+    """Spec (d): actionable ValueError pointing at token_list()."""
     with pytest.raises(ValueError, match="token_list"):
         srv.quote("NOPE")
 
@@ -240,7 +240,7 @@ def test_quote_unknown_symbol_mentions_token_list(mock_api):
 # ------------------------------------------------------------------- quotes
 
 def test_quotes_batch_known_and_unknown_split(mock_api):
-    """ТЗ (е): unknown -> errors, known -> quotes."""
+    """Spec (f): unknown -> errors, known -> quotes."""
     out = srv.quotes(["AAPL", "MSFT", "NOPE"])
     assert [q["symbol"] for q in out["quotes"]] == ["AAPL", "MSFT"]
     assert len(out["errors"]) == 1
@@ -249,7 +249,7 @@ def test_quotes_batch_known_and_unknown_split(mock_api):
 
 
 def test_quotes_max_20_symbols(mock_api):
-    """ТЗ (д): 21 symbols -> ValueError telling to split the batch."""
+    """Spec (e): 21 symbols -> ValueError telling to split the batch."""
     with pytest.raises(ValueError, match="20"):
         srv.quotes([f"S{i}" for i in range(21)])
     ok = srv.quotes(["AAPL"] * 20)  # exactly 20 is allowed (dupes ok)
@@ -287,7 +287,7 @@ def test_token_detail_embeds_quote_view(mock_api):
 
 
 def test_token_detail_pending_split_warning(mock_api):
-    """ТЗ (ж): pendingMultiplier + effectiveTime -> warnings entry."""
+    """Spec (g): pendingMultiplier + effectiveTime -> warnings entry."""
     td = srv.token_detail("SPLT")
     assert td["multiplier"]["pending"] == 4.0
     assert any("pending split" in w and "4.0" in w
@@ -336,7 +336,7 @@ def test_market_status_counts_from_assets_only(mock_api):
 
 
 def test_market_status_halted_from_cached_quotes(mock_api):
-    """ТЗ (в): halted token (cached price) shows in market_status()."""
+    """Spec (c): halted token (cached price) shows in market_status()."""
     ms = srv.market_status()
     assert ms["halted"] == ["HALT"]
 
@@ -377,7 +377,7 @@ def test_corporate_actions_symbol_filter_and_limit(mock_api):
 # ------------------------------------------------------------------- search
 
 def test_search_apple_ranks_aapl_first(mock_api):
-    """ТЗ (и): 'apple' -> AAPL first (name-word match)."""
+    """Spec (i): 'apple' -> AAPL first (name-word match)."""
     sr = srv.search("apple")
     assert sr["results"][0]["symbol"] == "AAPL"
     assert sr["count"] >= 1
@@ -431,7 +431,7 @@ def test_sector_view_halted_listed_per_sector(mock_api):
 
 
 def test_sector_view_cold_cache_avg_none_with_note(cold_cache):
-    """ТЗ (з): no cached quotes -> avg None, explanatory note present."""
+    """Spec (h): no cached quotes -> avg None, explanatory note present."""
     sv = srv.sector_view()
     for name, sec in sv["sectors"].items():
         assert sec["avg_bid_adjusted"] is None, name
@@ -453,7 +453,7 @@ def test_sector_view_never_fetches_prices(cold_cache, monkeypatch):
 # --------------------------------------------------------------- onchain_info
 
 def test_onchain_info_stub_fields(mock_api):
-    """ТЗ (й): v0.2 stub - contract/chain/decimals/isin + note."""
+    """Spec (j): v0.2 stub - contract/chain/decimals/isin + note."""
     oc = srv.onchain_info("AAPL")
     aapl_dep = AAPL_ASSET["deployments"][0]
     assert oc["symbol"] == "AAPL"

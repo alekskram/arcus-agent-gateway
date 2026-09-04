@@ -2,7 +2,7 @@
 
 Monkeypatches api.assets/api.asset/api.prices/api.corporate_actions in
 the arcus_mcp.server namespace (server only ever calls api.<fn>(), by
-design) and exercises all 9 MCP tools of MEC-53 plus the ТЗ invariants:
+design) and exercises all 9 MCP tools of the design spec plus its invariants:
 
   * adjusted prices: bid_adjusted == round(bid_raw * multiplier, 6)
   * spread_raw >= 0
@@ -343,7 +343,7 @@ tool_names, tool_meta = asyncio.run(_tools_meta())
 
 EXPECTED = {"token_list", "quote", "quotes", "token_detail", "market_status",
             "corporate_actions", "search", "sector_view", "onchain_info"}
-check("build_server: exactly the 9 MEC-53 tools registered",
+check("build_server: exactly the 9 spec tools registered",
       tool_names == EXPECTED, f"got {sorted(tool_names)}")
 check("build_server: all tools read-only annotated",
       all(v == (True, False) for v in tool_meta.values()), str(tool_meta))

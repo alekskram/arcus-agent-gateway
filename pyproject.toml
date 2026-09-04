@@ -21,9 +21,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mecorp/arcus-agent-gateway"
-Repository = "https://github.com/mecorp/arcus-agent-gateway"
-Issues = "https://github.com/mecorp/arcus-agent-gateway/issues"
+Homepage = "https://github.com/alekskram/arcus-agent-gateway"
+Repository = "https://github.com/alekskram/arcus-agent-gateway"
+Issues = "https://github.com/alekskram/arcus-agent-gateway/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "pip-audit"]

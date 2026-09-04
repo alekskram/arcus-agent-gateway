@@ -1,6 +1,6 @@
 """Arcus Agent Gateway - MCP server (Robinhood Chain / rhj tokenized equities).
 
-Read-only, keyless market-data tools per MEC-53: token_list, quote(s),
+Read-only, keyless market-data tools per the design spec: token_list, quote(s),
 token_detail, market_status, corporate_actions, search, sector_view,
 onchain_info. Sectors come from the static validated map in sectors.py.
 
@@ -446,7 +446,7 @@ def onchain_info(symbol: str) -> dict:
 
 
 def build_server():
-    """FastMCP instance with the 9 read-only MEC-53 tools wired."""
+    """FastMCP instance with the 9 read-only spec tools wired."""
     from fastmcp import FastMCP
     from starlette.requests import Request
     from starlette.responses import JSONResponse

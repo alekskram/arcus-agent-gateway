@@ -1,6 +1,6 @@
 """Unit tests for arcus_mcp.api - 100% offline (fixtures + fake clock).
 
-Covers the MEC-54 invariants for the REST client layer:
+Covers the spec invariants for the REST client layer:
   * cache TTLs (assets 300s, prices 15s, corporate-actions 3600s):
     no repeat HTTP inside the TTL, refetch after it
   * asset() case-insensitive lookup

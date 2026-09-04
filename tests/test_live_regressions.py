@@ -1,4 +1,4 @@
-"""Live-capture regressions (final smoke 2026-09-03, MEC-54).
+"""Live-capture regressions (final smoke 2026-09-03).
 
 Two defects seen on the LIVE API and pinned here so they never return:
 1. /corporate-actions `effectiveTime` arrives as a protobuf Timestamp

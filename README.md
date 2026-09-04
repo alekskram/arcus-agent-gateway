@@ -1,5 +1,10 @@
 # arcus-agent-gateway
 
+[![CI](https://github.com/alekskram/arcus-agent-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/alekskram/arcus-agent-gateway/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/arcus-agent-gateway.svg)](https://pypi.org/project/arcus-agent-gateway/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
+
 An MCP (Model Context Protocol) server that gives AI agents read-only, keyless
 access to market data for the **194 tokenized US equities** on **Robinhood Chain
 (Arcus)** — quotes, corporate actions, trading capabilities, multipliers and a
