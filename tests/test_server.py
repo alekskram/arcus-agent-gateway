@@ -26,11 +26,13 @@ Pinned MEC-53 invariants (see scripts/smoke_server_offline.py):
 """
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import pytest
 
 import arcus_mcp.api as api
+import arcus_mcp.sectors as sectors
 import arcus_mcp.server as srv
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -546,3 +548,103 @@ def test_action_row_split_rates_untouched():
            "splitTo": "4.0", "processDate": "2026-09-01"}
     row = srv._action_row(act)
     assert row["details"] == {"old_rate": 1.0, "new_rate": 4.0, "rate": None}
+
+# ------------------------------------------------- MEC-57 parallel quotes
+
+def test_quotes_parallel_ten_symbols_under_1_5s(monkeypatch):
+    """T1 MEC-57: 10 symbols, each quote costing 300ms of fake RTT,
+    finish well under the serial 3s - the semaphore(8) fan-out wall
+    clock is ~2 rounds (~0.6s); assert < 1.5s with headroom for
+    threads+GIL. All 10 present, input order kept, no errors."""
+    syms = [f"P{i}" for i in range(10)]
+    assets_rows = [{
+        "tokenSymbol": s, "tokenName": f"{s} • Robinhood Token",
+        "currentMultiplier": "1.000000000000000000",
+        "pendingMultiplier": "",
+        "status": "ASSET_STATUS_ACTIVE",
+        "tradingCapabilities": {
+            "market": {"whole": "TRADING_STATUS_TRADABLE",
+                       "fractional": "TRADING_STATUS_TRADABLE"},
+            "extended": {"whole": "TRADING_STATUS_TRADABLE",
+                         "fractional": "TRADING_STATUS_TRADABLE"},
+            "overnight": {"whole": "TRADING_STATUS_TRADABLE",
+                          "fractional": "TRADING_STATUS_TRADABLE"}},
+    } for s in syms]
+
+    def _slow_prices(symbol):
+        time.sleep(0.3)  # fake RTT
+        return {"tokenSymbol": symbol, "bid": "10.00", "ask": "10.02",
+                "dailyTradingVolume": "1", "isTradingHalt": False,
+                "generatedAt": "2026-09-04T00:00:00Z"}
+
+    monkeypatch.setattr(api, "assets", lambda: assets_rows)
+    monkeypatch.setattr(api, "asset", lambda symbol: next(
+        (a for a in assets_rows
+         if a["tokenSymbol"] == (symbol or "").strip().upper()), None))
+    monkeypatch.setattr(api, "prices", _slow_prices)
+    monkeypatch.setattr(api, "_PRICES_CACHE", {})  # cold: every
+    # symbol must really go through prices()
+
+    t0 = time.monotonic()
+    out = srv.quotes(syms)
+    dt = time.monotonic() - t0
+    assert dt < 1.5, f"quotes() took {dt:.2f}s - not parallel"
+    assert [q["symbol"] for q in out["quotes"]] == syms  # order kept
+    assert out["errors"] == []
+    assert all(q["bid_raw"] == 10.0 for q in out["quotes"])
+
+
+# ---------------------------------------------- MEC-57 sector_view warm
+
+def test_sector_view_warm_single_sector(mock_api, monkeypatch):
+    """T2 MEC-57: warm the 4-symbol Crypto sector - warmed True,
+    requests_made == 4 (cold cache: every symbol is a miss), averages
+    populated, and 'sectors' holds ONLY the warmed one."""
+    crypto = sectors.SECTORS["Crypto/Digital Assets"]
+    assert len(crypto) == 4
+    calls = []
+
+    def _caching_prices(symbol):
+        # behave like the real api.prices: return + cache the quote so
+        # the warm fan-out actually populates _PRICES_CACHE
+        want = (symbol or "").strip().upper()
+        calls.append(want)
+        q = {**AAPL_QUOTE, "tokenSymbol": want,
+             "bid": "100.00", "ask": "100.10"}
+        monkeypatch.setattr(
+            api, "_PRICES_CACHE",
+            {**getattr(api, "_PRICES_CACHE", {}),
+             want: (time.monotonic(), q)})
+        return q
+
+    monkeypatch.setattr(api, "prices", _caching_prices)
+    monkeypatch.setattr(api, "_PRICES_CACHE", {})  # cold at start
+    sv = srv.sector_view(warm=True, sector="Crypto/Digital Assets")
+    assert sv["warmed"] is True
+    assert sv["requests_made"] == 4
+    assert sorted(calls) == sorted(crypto)  # fan-out hit all 4 symbols
+    assert list(sv["sectors"]) == ["Crypto/Digital Assets"]
+    row = sv["sectors"]["Crypto/Digital Assets"]
+    assert row["quoted"] == 4
+    assert row["avg_bid_adjusted"] is not None
+    assert row["avg_ask_adjusted"] is not None
+
+
+def test_sector_view_warm_unknown_sector_raises(mock_api):
+    """T3 MEC-57: unknown sector name -> ValueError with the valid set."""
+    with pytest.raises(ValueError, match="Crypto/Digital Assets"):
+        srv.sector_view(warm=True, sector="Nope/Nothing")
+
+
+def test_sector_view_default_makes_no_requests(mock_api, monkeypatch):
+    """T4 MEC-57: default warm=False never touches api.prices."""
+    def _no_prices(symbol):
+        raise AssertionError(
+            "sector_view(warm=False) must not fetch prices")
+
+    monkeypatch.setattr(api, "prices", _no_prices)
+    monkeypatch.setattr(api, "_PRICES_CACHE", {})
+    sv = srv.sector_view()  # must not raise
+    assert sv["warmed"] is False
+    assert "requests_made" not in sv
+    assert len(sv["sectors"]) == 13
