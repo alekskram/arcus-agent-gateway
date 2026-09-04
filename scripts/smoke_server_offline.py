@@ -11,7 +11,7 @@ design) and exercises all 9 MCP tools of MEC-53 plus the spec invariants:
   * no-quote symbol -> metadata with bid/ask None + note
   * sector averages populate only after quotes() (cache-driven)
   * corporate-actions field-name tolerance (3 synthetic variants)
-  * fastmcp build_server() wires all 9 tools with RO annotations
+  * fastmcp build_server() wires all 10 tools with RO annotations
 
 Run: .venv/bin/python scripts/smoke_server_offline.py
 """
@@ -228,7 +228,8 @@ check("token_detail: quote embedded", td["quote"]["symbol"] == "SPLT")
 check("token_detail: last 5 corporate actions, tolerant mapping",
       td["corporate_actions"][0]["type"] == "SPLIT"
       and td["corporate_actions"][0]["details"] == {"old_rate": 1.0,
-                                                    "new_rate": 4.0}
+                                                    "new_rate": 4.0,
+                                                    "rate": None}
       and "splitFrom" in td["corporate_actions"][0]["raw"])
 check("token_detail: multiplier with history_note + pending",
       td["multiplier"]["pending"] == 4.0
@@ -269,7 +270,7 @@ check("corporate_actions: all 3, count field",
 types = [(a["symbol"], a["type"], a["details"]) for a in ca["actions"]]
 check("corporate_actions: field variants normalized (kind/actionType/type)",
       [t[1] for t in types] == ["DIVIDEND", "SPLIT", "SPLIT"]
-      and types[2][2] == {"old_rate": 2.0, "new_rate": 1.0},
+      and types[2][2] == {"old_rate": 2.0, "new_rate": 1.0, "rate": None},
       str(types))
 ca_s = srv.corporate_actions(symbol="MSFT", limit=5)
 check("corporate_actions: symbol filter + limit",
@@ -342,8 +343,9 @@ async def _tools_meta():
 tool_names, tool_meta = asyncio.run(_tools_meta())
 
 EXPECTED = {"token_list", "quote", "quotes", "token_detail", "market_status",
-            "corporate_actions", "search", "sector_view", "onchain_info"}
-check("build_server: exactly the 9 MEC-53 tools registered",
+            "corporate_actions", "search", "sector_view", "onchain_info",
+            "price_history"}
+check("build_server: exactly the 10 v0.1.1 tools registered",
       tool_names == EXPECTED, f"got {sorted(tool_names)}")
 check("build_server: all tools read-only annotated",
       all(v == (True, False) for v in tool_meta.values()), str(tool_meta))
