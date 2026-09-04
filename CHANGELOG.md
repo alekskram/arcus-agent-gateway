@@ -2,7 +2,7 @@
 
 ## 0.2.1 (2026-09-04)
 
-Recorder wheel-packaging fix (MEC-69): after
+Recorder wheel-packaging fix (v0.2.1): after
 `pip install arcus-agent-gateway[recorder]` the systemd unit's
 `python -m scripts.recorder --once` failed with
 `No module named scripts.recorder` — `[tool.hatch.build.targets.wheel]

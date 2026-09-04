@@ -5,14 +5,14 @@ Covers:
   [T2] roll_daily OHLC + volume=MAX (not sum) + idempotent re-run
   [T3] missing pyarrow -> SystemExit with the [recorder] extra hint
   [T4] universe() filters ACTIVE + market-tradable only
-  [T5] wheel packaging (MEC-69): arcus_mcp/recorder.py ships inside
+  [T5] wheel packaging regression: arcus_mcp/recorder.py ships inside
        the wheel and scripts/ does not; scripts/recorder.py is a shim
        that delegates to the package module
 
 No socket may open: arcus_mcp.api.assets/prices are monkeypatched, and
 tests/conftest.py has already pointed ARCUS_GATEWAY_DATA at a tmp dir.
 
-Since 0.2.1 the recorder lives in the package (MEC-69: scripts/ was
+Since 0.2.1 the recorder lives in the package (regression: scripts/ was
 never packaged, so pip installs died on `python -m scripts.recorder`)
 and is imported directly.
 """
@@ -248,11 +248,11 @@ def test_mid_adjusted_uses_multiplier(monkeypatch):
     assert recorder.snap_row("t", "X", None, 1.0) is None
 
 
-# ------------------------------------------------- [T5] MEC-69 packaging
+# --------------------------------------- [T5] wheel-packaging regression
 
 
 def test_t5_wheel_ships_recorder_module(tmp_path):
-    """MEC-69 regression: build the real wheel with hatchling (offline,
+    """Recorder wheel-packaging regression: build the real wheel with hatchling (offline,
     no pip/network) and assert the recorder is IN it. The bug was that
     scripts/ was never packaged, so `python -m scripts.recorder` died
     on pip installs; the fix ships arcus_mcp/recorder.py instead."""

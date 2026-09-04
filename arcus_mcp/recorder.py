@@ -10,7 +10,7 @@ files, plus an idempotent daily rollup:
 Requires pyarrow - install the optional extra:
     pip install 'arcus-agent-gateway[recorder]'
 
-Shipped inside the wheel since 0.2.1 (MEC-69): the unit's
+Shipped inside the wheel since 0.2.1: the unit's
 `python -m scripts.recorder` failed on pip installs because scripts/
 is not packaged. scripts/recorder.py stays behind as a thin shim for
 git-checkout users.

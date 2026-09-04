@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""v0.2.1: thin shim kept for git-checkout users (MEC-69).
+"""v0.2.1: thin shim kept for git-checkout users.
 
 Since 0.2.1 the recorder ships inside the wheel as the package module
 arcus_mcp/recorder.py - `pip install arcus-agent-gateway[recorder]`
