@@ -21,7 +21,7 @@
 - **Dividend rates**: `/corporate-actions` live-verified (2026-09-04) —
   exposes per-share `details.cashDividend.rate` ("0.53"), no total cash
   amount; surfaced as `details.rate` in action rows.
-- Tests: 75 → 96 offline (recorder append/rollup, price_history
+- Tests: 75 → 99 offline (recorder append/rollup, price_history
   degradation, quotes parallelism timing, search limit, sector warm,
   dividend rate mapping).
 

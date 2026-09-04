@@ -152,7 +152,7 @@ silent empty answer.
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/pytest -q                      # 90+ tests, all offline (fixtures + mocks)
+.venv/bin/pytest -q                      # 99 tests, all offline (fixtures + mocks)
 .venv/bin/python scripts/smoke_api_offline.py     # REST client smoke, zero HTTP
 .venv/bin/python scripts/smoke_server_offline.py  # 9-tool server smoke, zero HTTP
 ```
