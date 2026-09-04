@@ -7,7 +7,7 @@ see API_NOTES.md). Cached read helpers on top of `_get()`:
     token(address)                GET /tokens/{a}                (TTL 600s)
     token_holders(address, limit) GET /tokens/{a}/holders        (TTL 600s)
     address_token_balances(a)     GET /addresses/{a}/token-balances
-                                                                 (TTL 600s)
+                                                                 (TTL 120s)
 
 Schema gotchas (live capture 2026-09-04, fixtures tests/fixtures/
 explorer_{token,holders,token_balances}.json): numerics arrive as
@@ -41,7 +41,9 @@ _TIMEOUT = 15.0   # token-balances on big contracts hangs 40s+ -> fail honest
 _RETRIES = 3      # 1 attempt + 2 retries, on 5xx/network only
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
-_TTL = 600.0
+_TTL = 600.0              # token + holders pages (slow-moving metrics)
+_BALANCES_TTL = 120.0     # address token-balances: wallet holdings need
+                          # fresher rows than holder demographics
 _TOKEN_CACHE: dict[str, tuple[float, dict | None]] = {}
 _HOLDERS_CACHE: dict[str, tuple[float, dict | None]] = {}
 _BALANCES_CACHE: dict[str, tuple[float, list | None]] = {}
@@ -217,7 +219,9 @@ def token_holders(address: str, limit: int = 50) -> dict | None:
 
 
 def address_token_balances(address: str) -> list | None:
-    """Flat /addresses/{a}/token-balances list (600s cache); None if 404.
+    """Flat /addresses/{a}/token-balances list (120s cache - fresher than
+    the token/holders pages because wallet holdings move faster); None
+    if 404.
 
     [{"token": {full /tokens/{a} dict, "address_hash", "symbol",
       "exchange_rate", ...}, "value": "229942366437633735816",
@@ -230,7 +234,7 @@ def address_token_balances(address: str) -> list | None:
     key = _norm_address(address)
     with _CACHE_LOCK:
         cached = _BALANCES_CACHE.get(key)
-        if cached and time.monotonic() - cached[0] <= _TTL:
+        if cached and time.monotonic() - cached[0] <= _BALANCES_TTL:
             return cached[1]
     raw = _get(f"/addresses/{key}/token-balances")
     out: list | None = None
