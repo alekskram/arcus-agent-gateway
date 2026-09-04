@@ -2,7 +2,9 @@
 
 Read-only, keyless market-data tools per MEC-53: token_list, quote(s),
 token_detail, market_status, corporate_actions, search, sector_view,
-onchain_info. Sectors come from the static validated map in sectors.py.
+onchain_info; plus price_history (MEC-57) reading the OPTIONAL local
+recorder's parquet files (honest degradation, no pyarrow -> no crash).
+Sectors come from the static validated map in sectors.py.
 
 Style follows dydx_mcp/server.py: plain functions registered via
 build_server() -> FastMCP, all annotated read-only. All upstream access
@@ -15,6 +17,7 @@ import asyncio
 import time
 
 from . import api
+from . import paths
 from . import sectors
 
 TRADABLE = "TRADING_STATUS_TRADABLE"
@@ -572,11 +575,102 @@ def onchain_info(symbol: str) -> dict:
     }
 
 
+# --------------------------------------------------------- price_history
+
+_DAILY_COLUMNS = ("symbol", "date", "open", "high", "low", "close", "volume")
+_RAW_COLUMNS = ("ts_utc", "symbol", "bid_raw", "ask_raw", "mid_adjusted",
+                "daily_volume", "multiplier", "is_halted")
+
+
+def _history_rows(table, columns: tuple[str, ...]) -> list[dict]:
+    """Parquet table -> list of plain dicts, one per row, pyarrow types
+    coerced to JSON-safe Python (bool stays bool, numbers -> float)."""
+    n = len(table)
+    cols = {name: table.column(name).to_pylist() if name in table.column_names
+            else [None] * n for name in columns}
+    # fill any column missing from an older file with None
+    return [{k: cols[k][i] for k in columns} for i in range(n)]
+
+
+def price_history(symbol: str, timeframe: str = "daily",
+                  limit: int = 90) -> dict:
+    """Historical prices recorded by the OPTIONAL local recorder
+    (scripts/recorder.py) - not a live API call. timeframe='daily':
+    OHLCV bars from history/daily.parquet (open/high/low/close are
+    multiplier-adjusted); timeframe='raw': every recorded snapshot
+    (bid/ask raw, mid_adjusted, multiplier, is_halted) from
+    history/snapshots_*.parquet. Rows are newest-first. The symbol is
+    NOT checked against token_list (the recorder writes the whole
+    universe; assets drift) - a symbol simply absent from the file
+    returns count 0. Degrades honestly instead of raising when the
+    optional pieces are missing: pyarrow absent -> error suggesting
+    'pip install arcus-agent-gateway[recorder]'; recorder never run /
+    no data yet -> error pointing at README § Optional price history
+    recorder. limit must be positive (daily capped at 200, raw at 500).
+    Example: price_history(symbol='AAPL', timeframe='daily', limit=30)"""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol required")
+    tf = (timeframe or "").strip().lower()
+    if tf not in ("daily", "raw"):
+        raise ValueError(
+            f"unknown timeframe {timeframe!r}: use 'daily' or 'raw'")
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        raise ValueError(f"limit must be positive, got {limit!r}")
+    if n <= 0:
+        raise ValueError("limit must be positive")
+    n = min(n, 200 if tf == "daily" else 500)
+    out: dict = {"symbol": sym, "timeframe": tf, "count": 0, "rows": []}
+    try:  # lazy: pyarrow ships only with the [recorder] extra
+        import pyarrow.parquet as pq
+    except ImportError:
+        out["error"] = ("pyarrow not installed - install "
+                        "arcus-agent-gateway[recorder] to enable price "
+                        "history")
+        out["hint"] = "README § Optional price history recorder"
+        return out
+
+    history = paths.data_dir() / "history"
+    files = ([history / "daily.parquet"] if tf == "daily"
+             else sorted(history.glob("snapshots_*.parquet")))
+    tables = []
+    for f in files:
+        try:
+            if f.exists():
+                tables.append(pq.read_table(f))
+        except Exception as exc:  # corrupt file: skip, don't crash
+            out.setdefault("warnings", []).append(
+                f"skipped unreadable {f.name}: {exc}")
+    if not tables:
+        out["error"] = ("recorder not enabled or no data yet - see README "
+                        "§ Optional price history recorder")
+        out["note"] = ("no snapshot files found; run the recorder "
+                       "(scripts/recorder.py) to start collecting"
+                       if tf == "raw" else
+                       "need >= 1 day of snapshots for daily bars; "
+                       "snapshots accumulate at the recorder interval "
+                       "(default 300s)")
+        return out
+    columns = _DAILY_COLUMNS if tf == "daily" else _RAW_COLUMNS
+    key = "date" if tf == "daily" else "ts_utc"
+    rows: list[dict] = []
+    for t in tables:
+        rows.extend(_history_rows(t, columns))
+    rows = [r for r in rows if r.get("symbol") == sym]
+    rows.sort(key=lambda r: r.get(key) or "", reverse=True)
+    out["rows"] = rows[:n]
+    out["count"] = len(out["rows"])
+    return out
+
+
 # --------------------------------------------------------------- MCP wire
 
 
 def build_server():
-    """FastMCP instance with the 9 read-only MEC-53 tools wired."""
+    """FastMCP instance with the 10 read-only tools wired (9 MEC-53
+    live-data tools + price_history over the local recorder files)."""
     from fastmcp import FastMCP
     from starlette.requests import Request
     from starlette.responses import JSONResponse
@@ -605,7 +699,8 @@ def build_server():
     RO = {"readOnlyHint": True, "destructiveHint": False,
           "openWorldHint": True}
     for tool in (token_list, quote, quotes, token_detail, market_status,
-                 corporate_actions, search, sector_view, onchain_info):
+                 corporate_actions, search, sector_view, onchain_info,
+                 price_history):
         mcp.tool(tool, annotations=RO)
     return mcp
 

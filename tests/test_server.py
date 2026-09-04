@@ -476,10 +476,10 @@ def test_onchain_info_unknown_symbol(mock_api):
 
 EXPECTED_TOOLS = {"token_list", "quote", "quotes", "token_detail",
                   "market_status", "corporate_actions", "search",
-                  "sector_view", "onchain_info"}
+                  "sector_view", "onchain_info", "price_history"}
 
 
-def test_build_server_registers_exactly_nine_readonly_tools(mock_api):
+def test_build_server_registers_exactly_ten_readonly_tools(mock_api):
     mcp = srv.build_server()
     tools = asyncio.run(mcp.list_tools())
     names = {t.name for t in tools}
@@ -648,3 +648,153 @@ def test_sector_view_default_makes_no_requests(mock_api, monkeypatch):
     assert sv["warmed"] is False
     assert "requests_made" not in sv
     assert len(sv["sectors"]) == 13
+
+# ------------------------------------------------------------ price_history
+# MEC-57: recorder parquet reads. conftest redirects ARCUS_GATEWAY_DATA
+# to a per-session temp dir, so writing under paths.data_dir()/history
+# never touches production state. Every test writes its own fixture
+# file first (no cross-test file coupling).
+
+def _write_history_parquet(name: str, columns: dict) -> None:
+    """Write one parquet file under <data_dir>/history. pyarrow is a
+    dev/test dependency only - imported lazily, exactly like the tool."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    hist = srv.paths.data_dir() / "history"
+    hist.mkdir(parents=True, exist_ok=True)
+    pq.write_table(pa.table(columns), hist / name)
+
+
+def test_price_history_no_pyarrow_degrades_to_install_hint(monkeypatch):
+    """[T1] pyarrow missing -> honest error dict (never an exception).
+
+    Sanity first: without the import mock the same call succeeds, so
+    the ImportError path below is genuinely the one under test.
+    """
+    _write_history_parquet("daily.parquet", {
+        "symbol": ["AAPL"], "date": ["2026-09-01"],
+        "open": [100.0], "high": [100.5], "low": [99.5],
+        "close": [100.2], "volume": [1000.0]})
+    ok = srv.price_history("AAPL")
+    assert "error" not in ok and ok["count"] == 1
+
+    import builtins
+    real_import = builtins.__import__
+
+    def no_pyarrow(name, *args, **kwargs):
+        if name == "pyarrow" or name.startswith("pyarrow."):
+            raise ImportError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_pyarrow)
+    out = srv.price_history("AAPL")
+    assert "install arcus-agent-gateway[recorder]" in out["error"]
+    assert out["hint"] == "README § Optional price history recorder"
+    assert out["symbol"] == "AAPL" and out["timeframe"] == "daily"
+    assert out["count"] == 0 and out["rows"] == []
+
+
+def test_price_history_no_data_degrades_daily_and_raw(monkeypatch,
+                                                      tmp_path):
+    """[T2] recorder never ran -> error dict pointing at the README,
+    with a timeframe-specific note."""
+    monkeypatch.setattr(srv.paths, "data_dir", lambda: tmp_path)
+    daily = srv.price_history("AAPL")
+    assert "recorder not enabled" in daily["error"]
+    assert "need >= 1 day of snapshots" in daily["note"]
+    assert daily["rows"] == [] and daily["count"] == 0
+    raw = srv.price_history("AAPL", timeframe="raw")
+    assert "recorder not enabled" in raw["error"]
+    assert raw["note"] == ("no snapshot files found; run the recorder "
+                           "(scripts/recorder.py) to start collecting")
+    assert raw["timeframe"] == "raw" and raw["count"] == 0
+
+
+def test_price_history_daily_happy_path_sorted_desc():
+    """[T3] daily bars: newest first, per-symbol filter, lower-case
+    input normalized, limit honored."""
+    _write_history_parquet("daily.parquet", {
+        "symbol": ["AAPL", "AAPL", "AAPL", "MSFT", "MSFT"],
+        "date": ["2026-09-01", "2026-09-02", "2026-09-03",
+                 "2026-09-02", "2026-09-03"],
+        "open": [100.0, 101.0, 102.0, 200.0, 201.0],
+        "high": [100.5, 101.5, 102.5, 200.5, 201.5],
+        "low": [99.5, 100.5, 101.5, 199.5, 200.5],
+        "close": [100.2, 101.2, 102.2, 200.2, 201.2],
+        "volume": [1000.0, 1100.0, 1200.0, 2000.0, 2100.0]})
+    out = srv.price_history("aapl", limit=2)  # case-insensitive
+    assert out["symbol"] == "AAPL" and out["timeframe"] == "daily"
+    assert out["count"] == 2 and len(out["rows"]) == 2
+    assert all(r["symbol"] == "AAPL" for r in out["rows"])
+    assert [r["date"] for r in out["rows"]] == ["2026-09-03",
+                                                "2026-09-02"]
+    assert set(out["rows"][0]) == {"symbol", "date", "open", "high",
+                                   "low", "close", "volume"}
+
+
+def test_price_history_raw_snapshots_happy_path():
+    """[T4] raw timeframe: snapshots_*.parquet rows, ts_utc DESC."""
+    _write_history_parquet("snapshots_202609.parquet", {
+        "ts_utc": ["2026-09-03T20:00:05Z", "2026-09-03T20:05:05Z",
+                   "2026-09-03T20:10:05Z", "2026-09-03T20:05:05Z"],
+        "symbol": ["AAPL", "AAPL", "AAPL", "MSFT"],
+        "bid_raw": [327.77, 327.80, 327.75, 500.10],
+        "ask_raw": [327.78, 327.82, 327.77, 500.12],
+        "mid_adjusted": [327.775, 327.81, 327.76, 500.11],
+        "daily_volume": [25806784.0, 25810000.0, 25820000.0, 1000000.0],
+        "multiplier": [1.0, 1.0, 1.0, 4.0],
+        "is_halted": [False, False, True, False]})
+    out = srv.price_history("AAPL", timeframe="raw")
+    assert out["timeframe"] == "raw" and out["count"] == 3
+    assert all(r["symbol"] == "AAPL" for r in out["rows"])
+    ts = [r["ts_utc"] for r in out["rows"]]
+    assert ts == sorted(ts, reverse=True)  # newest first
+    assert set(out["rows"][0]) == {"ts_utc", "symbol", "bid_raw",
+                                   "ask_raw", "mid_adjusted",
+                                   "daily_volume", "multiplier",
+                                   "is_halted"}
+
+
+def test_price_history_validates_timeframe_and_limit():
+    """[T5] bad timeframe names the valid options; limit must be
+    positive."""
+    with pytest.raises(ValueError, match="unknown timeframe") as e:
+        srv.price_history("AAPL", timeframe="weekly")
+    assert "daily" in str(e.value) and "raw" in str(e.value)
+    with pytest.raises(ValueError, match="limit must be positive"):
+        srv.price_history("AAPL", limit=0)
+
+
+def test_price_history_absent_symbol_is_empty_not_an_error():
+    """File exists but the symbol was never recorded -> honest empty
+    answer (recorder writes the whole universe; assets drift), NOT the
+    recorder-not-enabled degradation."""
+    _write_history_parquet("daily.parquet", {
+        "symbol": ["MSFT", "MSFT"], "date": ["2026-09-02", "2026-09-03"],
+        "open": [200.0, 201.0], "high": [200.5, 201.5],
+        "low": [199.5, 200.5], "close": [200.2, 201.2],
+        "volume": [2000.0, 2100.0]})
+    out = srv.price_history("AAPL")
+    assert "error" not in out
+    assert out["count"] == 0 and out["rows"] == []
+    assert out["symbol"] == "AAPL"
+
+
+def test_price_history_blank_symbol_raises():
+    for bad in ("", "   "):
+        with pytest.raises(ValueError, match="symbol required"):
+            srv.price_history(bad)
+
+
+def test_price_history_daily_limit_capped_at_200():
+    """limit=10000 on daily still returns at most 200 rows."""
+    n = 250
+    _write_history_parquet("daily.parquet", {
+        "symbol": ["AAPL"] * n,
+        "date": [f"2026-{1 + i // 28:02d}-{1 + i % 28:02d}"
+                 for i in range(n)],
+        "open": [100.0] * n, "high": [100.5] * n, "low": [99.5] * n,
+        "close": [100.2] * n, "volume": [1000.0] * n})
+    out = srv.price_history("AAPL", limit=10000)
+    assert out["count"] == 200 and len(out["rows"]) == 200
