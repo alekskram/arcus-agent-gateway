@@ -220,24 +220,3 @@ snapshots from the same directory. Without pyarrow or data it returns an
 actionable error pointing here — install the `[recorder]` extra, never a
 silent empty answer.
 
-## Development
-
-```bash
-python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
-.venv/bin/pytest -q                              # offline suite (fixtures + mocks)
-.venv/bin/python scripts/smoke_api_offline.py    # REST client smoke, zero HTTP
-.venv/bin/python scripts/smoke_server_offline.py # full server smoke, zero HTTP
-```
-
-| Module | Role |
-|--------|------|
-| `arcus_mcp/api.py` | stdlib REST client (assets, prices, corporate actions) |
-| `arcus_mcp/rpc.py` | public JSON-RPC client; adaptive Transfer-log walk-back |
-| `arcus_mcp/explorer.py` | Blockscout v2 client (sends a browser User-Agent) |
-| `arcus_mcp/server.py` | the MCP tools + FastMCP wiring |
-| `arcus_mcp/sectors.py` | validated 13-sector map |
-| `arcus_mcp/paths.py` | state dir; override with `ARCUS_GATEWAY_DATA` |
-
-Live-captured schema fixtures live in `tests/fixtures/`, with API gotchas
-documented in [`arcus_mcp/API_NOTES.md`](arcus_mcp/API_NOTES.md). End-to-end
-agent scenarios: [`examples/use-cases.md`](examples/use-cases.md).
