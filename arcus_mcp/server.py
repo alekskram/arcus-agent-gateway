@@ -312,8 +312,10 @@ def market_status() -> dict:
 def _action_row(act: dict) -> dict:
     """Normalize one corporate action; tolerant to the field-name variants
     seen in the wild (type|actionType|kind, processDate|effectiveTime,
-    *From/*To/splitFrom/splitTo for the rates). `raw` keeps the original
-    untouched."""
+    *From/*To/splitFrom/splitTo for the rates). Cash dividends carry
+    details.cashDividend.rate (per-share amount, STRING) - surfaced as
+    details.rate; the API exposes no total cash amount (API_NOTES #5).
+    `raw` keeps the original untouched."""
     typ = next((act[k] for k in ("type", "actionType", "kind")
                 if act.get(k)), None)
     when = next((act[k] for k in ("processDate", "effectiveTime",
@@ -323,12 +325,15 @@ def _action_row(act: dict) -> dict:
                      if k.endswith("From") and _f(act[k]) is not None), None)
     new_rate = next((act[k] for k in sorted(act)
                      if k.endswith("To") and _f(act[k]) is not None), None)
+    cash = ((act.get("details") or {}).get("cashDividend") or {})
+    rate = cash.get("rate")
     return {
         "symbol": act.get("tokenSymbol"),
         "type": typ,
         "status": act.get("status"),
-        "process_date": when,
-        "details": {"old_rate": _f(old_rate), "new_rate": _f(new_rate)},
+        "process_date": _ts(when),
+        "details": {"old_rate": _f(old_rate), "new_rate": _f(new_rate),
+                    "rate": _f(rate)},
         "raw": act,
     }
 
@@ -344,12 +349,13 @@ def corporate_actions(symbol: str | None = None, limit: int = 10) -> dict:
     return {"actions": rows, "count": len(rows)}
 
 
-def search(query: str) -> dict:
+def search(query: str, limit: int = 10) -> dict:
     """Local fuzzy search over the token list - no HTTP beyond the cached
     assets(). Ranking: exact symbol > symbol prefix > name-word prefix >
-    substring in name/symbol (case-insensitive); top 10 with score.
+    substring in name/symbol (case-insensitive); top `limit` (default
+    10, cap 50) with score.
     'apple' -> AAPL. Results carry symbol, name, status, sector, score.
-    Example: search(query="apple")"""
+    Example: search(query="apple", limit=3)"""
     q = (query or "").strip().lower()
     if not q:
         return {"query": query, "results": [], "count": 0}
@@ -375,8 +381,9 @@ def search(query: str) -> dict:
             "sector": sectors.sector_of(sym),
             "score": score,
         }))
+    n = max(0, min(int(limit), 50))
     scored.sort(key=lambda t: (-t[0], t[1], t[2]))
-    top = [row for _, _, _, row in scored[:10]]
+    top = [row for _, _, _, row in scored[:n]]
     return {"query": query, "results": top, "count": len(top)}
 
 
@@ -453,7 +460,7 @@ def build_server():
 
     mcp = FastMCP(
         "arcus-agent-gateway",
-        version="0.1.0",
+        version="0.1.1",
         instructions=(
             "Tokenized US equities on Robinhood Chain (Arcus DEX), "
             "read-only and keyless. Symbols come from token_list()/search() "

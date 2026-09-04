@@ -19,11 +19,16 @@ Non-obvious details for anyone building on `arcus_mcp/api.py`. Fixtures:
    (`2026-09-03T19:43:54.478722091Z`). Python 3.11+ `datetime.fromisoformat`
    handles it after replacing the `Z` suffix with `+00:00` (3.11+ also
    accepts the bare `Z`).
-5. **`/corporate-actions` response shape was NOT captured live** — no
-   fixture exists. `corporate_actions()` therefore accepts both a bare
-   JSON list and a dict-wrapped list (first list value found). Confirm the
-   real wrapper key on the first live call and tighten if desired. Symbol
-   filtering is done locally (query params not contractual).
+5. **`/corporate-actions` wraps items as `{"corpActions": [...]}`** (live
+   capture 2026-09-04, 45 items, fixture
+   `tests/fixtures/corporate_actions.json`). Every item: `id`, `type`
+   (`CORPORATE_ACTION_TYPE_CASH_DIVIDEND` in the capture), `status`,
+   `processDate` (protobuf Timestamp dict `{year, month, day}`), and
+   `details.cashDividend.rate` — a per-share STRING amount (`"0.53"`).
+   **The API exposes the dividend RATE per share but NO total cash
+   amount** (verified 2026-09-04): `_action_row` surfaces it as
+   `details.rate`. Symbol filtering is done locally (query params not
+   contractual).
 6. **Unknown symbol on `/prices/{x}` returns 404** — `prices()` maps that
    to `None` (distinguishing "no quote" from "API down" is left to `get()`'s
    exceptions). `asset()` likewise returns `None` for unknown symbols.

@@ -1,0 +1,15 @@
+[Unit]
+Description=Arcus Agent Gateway - price history recorder schedule (5 min)
+Documentation=file:///usr/share/doc/arcus-agent-gateway/README.md
+
+[Timer]
+# Every 5 minutes by default; the recorder itself defaults to 300s too.
+# OPT-IN ONLY: this unit ships DISABLED. Enable explicitly with
+#   systemctl enable --now arcus-recorder.timer
+OnCalendar=*:0/5
+# Catch up a missed tick after suspend/downtime (idempotent rollup makes
+# double ticks safe: snapshots dedupe on (ts_utc, symbol))
+Persistent=true
+
+[Install]
+WantedBy=timers.target

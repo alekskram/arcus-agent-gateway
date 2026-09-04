@@ -1,6 +1,6 @@
 [project]
 name = "arcus-agent-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP gateway for AI agents to Robinhood Chain (Arcus DEX) tokenized US equities: quotes, multipliers, corporate actions, market status, sectors. Read-only, keyless."
 readme = "README.md"
 requires-python = ">=3.11"

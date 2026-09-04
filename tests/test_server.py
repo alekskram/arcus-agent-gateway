@@ -311,7 +311,7 @@ def test_token_detail_corporate_actions_tolerant_mapping(mock_api):
     rows = td["corporate_actions"]
     assert len(rows) == 1
     assert rows[0]["type"] == "SPLIT"           # actionType variant
-    assert rows[0]["details"] == {"old_rate": 1.0, "new_rate": 4.0}
+    assert rows[0]["details"] == {"old_rate": 1.0, "new_rate": 4.0, "rate": None}
     assert "splitFrom" in rows[0]["raw"]        # original kept untouched
 
 
@@ -365,7 +365,7 @@ def test_corporate_actions_field_variants_normalized(mock_api):
     assert [r["type"] for r in rows] == ["DIVIDEND", "SPLIT", "SPLIT"]
     msft = next(r for r in rows if r["symbol"] == "MSFT")
     assert msft["type"] == "SPLIT"                # `type` variant
-    assert msft["details"] == {"old_rate": 2.0, "new_rate": 1.0}
+    assert msft["details"] == {"old_rate": 2.0, "new_rate": 1.0, "rate": None}
 
 
 def test_corporate_actions_symbol_filter_and_limit(mock_api):
@@ -500,3 +500,49 @@ def test_mcp_wire_call_quote_round_trip(mock_api):
     assert payload["bid_raw"] == 327.77
     assert payload["bid_adjusted"] == round(327.77 * payload[
         "multiplier"]["current"], 6)
+
+
+# ------------------------------------------------- MEC-57: search limit + rate
+
+
+def test_search_limit_param(tmp_path, monkeypatch):
+    """search(limit=N) caps results; default 10; cap 50."""
+    import arcus_mcp.server as srv
+
+    def fake_assets():
+        return [{"tokenSymbol": f"S{i:02d}", "tokenName": f"Sym {i}",
+                 "status": "ASSET_STATUS_ACTIVE"} for i in range(30)]
+
+    monkeypatch.setattr(srv.api, "assets", fake_assets)
+    r_all = srv.search("sym")
+    assert r_all["count"] == 10  # default limit
+    r3 = srv.search("sym", limit=3)
+    assert r3["count"] == 3
+    r_big = srv.search("sym", limit=99)  # cap 50
+    assert r_big["count"] == 30  # only 30 exist
+
+
+def test_action_row_dividend_rate():
+    """Live shape (2026-09-04): details.cashDividend.rate -> details.rate."""
+    import arcus_mcp.server as srv
+    act = {
+        "id": "0x1", "type": "CORPORATE_ACTION_TYPE_CASH_DIVIDEND",
+        "status": "CORPORATE_ACTION_STATUS_IN_PROGRESS",
+        "processDate": {"year": 2026, "month": 9, "day": 10},
+        "tokenSymbol": "AMAT",
+        "details": {"cashDividend": {"underlyingSymbol": "AMAT",
+                                     "rate": "0.53"}},
+    }
+    row = srv._action_row(act)
+    assert row["details"]["rate"] == 0.53
+    assert row["type"] == "CORPORATE_ACTION_TYPE_CASH_DIVIDEND"
+    assert row["process_date"] == "2026-09-10"  # protobuf dict -> ISO
+
+
+def test_action_row_split_rates_untouched():
+    """Split-shaped actions keep old_rate/new_rate; rate stays None."""
+    import arcus_mcp.server as srv
+    act = {"tokenSymbol": "CRWD", "type": "SPLIT", "splitFrom": "1.0",
+           "splitTo": "4.0", "processDate": "2026-09-01"}
+    row = srv._action_row(act)
+    assert row["details"] == {"old_rate": 1.0, "new_rate": 4.0, "rate": None}
