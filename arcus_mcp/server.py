@@ -1053,7 +1053,7 @@ def _history_rows(table, columns: tuple[str, ...]) -> list[dict]:
 def price_history(symbol: str, timeframe: str = "daily",
                   limit: int = 90) -> dict:
     """Historical prices recorded by the OPTIONAL local recorder
-    (scripts/recorder.py) - not a live API call. timeframe='daily':
+    (arcus_mcp/recorder.py since 0.2.1) - not a live API call. timeframe='daily':
     OHLCV bars from history/daily.parquet (open/high/low/close are
     multiplier-adjusted); timeframe='raw': every recorded snapshot
     (bid/ask raw, mid_adjusted, multiplier, is_halted) from
@@ -1105,7 +1105,7 @@ def price_history(symbol: str, timeframe: str = "daily",
         out["error"] = ("recorder not enabled or no data yet - see README "
                         "§ Optional price history recorder")
         out["note"] = ("no snapshot files found; run the recorder "
-                       "(scripts/recorder.py) to start collecting"
+                       "(python -m arcus_mcp.recorder) to start collecting"
                        if tf == "raw" else
                        "need >= 1 day of snapshots for daily bars; "
                        "snapshots accumulate at the recorder interval "
