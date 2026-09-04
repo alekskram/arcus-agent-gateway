@@ -1,6 +1,6 @@
 ---
 name: arcus-gateway
-description: Market data for Robinhood Chain (Arcus) tokenized US equities via the arcus-agent-gateway MCP server. Use for quotes, corporate actions, splits, market status, and sector data on the 194 tokenized stocks. Includes the watchlist/price-tracking cron recipe.
+description: Market data for Robinhood Chain (Arcus) tokenized US equities via the arcus-agent-gateway MCP server. Use for quotes, corporate actions, splits, market status, and sector data on the 194 tokenized stocks. Includes the watchlist/price-tracking cron recipe and price_history (v0.1.1).
 ---
 
 # Arcus Gateway (Robinhood Chain tokenized equities)
@@ -29,12 +29,12 @@ or `search()`; an unknown symbol raises an error that mentions `token_list()`.
 |------|------|-------|
 | `token_list` | `token_list(status="ACTIVE", limit=100)` | Valid symbols; alphabetical; `limit` ≤ 500. |
 | `quote` | `quote(symbol="AAPL")` | Raw + adjusted prices, `is_halted`, multiplier block. |
-| `quotes` | `quotes(symbols=["AAPL","NVDA"])` | **Max 20 symbols per call.** Unknowns → `errors`, batch continues. |
+| `quotes` | `quotes(symbols=["AAPL","NVDA"])` | **Max 20 symbols per call.** Unknowns → `errors`, batch continues. Parallel (semaphore 8): 10 cold symbols ≈ 1 s. |
 | `token_detail` | `token_detail(symbol="AAPL")` | Dossier: contract, ISIN, actions, `warnings` (pending split). |
 | `market_status` | `market_status()` | Cheap market health; `halted` lists only cached quotes. |
 | `corporate_actions` | `corporate_actions(symbol=None, limit=10)` | Splits/dividends, all or one symbol. |
-| `search` | `search(query="apple")` | `apple` → `AAPL`; top 10 with sector + score. |
-| `sector_view` | `sector_view()` | 13 sectors; averages populate only after `quotes()` calls. |
+| `search` | `search(query="apple", limit=10)` | `apple` → `AAPL`; top `limit` (cap 50) with sector + score. |
+| `sector_view` | `sector_view(warm=False, sector=None)` | 13 sectors. Default: cache-only averages. `warm=True, sector="Crypto/Digital Assets"` fans out fresh quotes for one sector (`warmed`, `requests_made`). |
 | `onchain_info` | `onchain_info(symbol="AAPL")` | Contract/chain 4663/ISIN — v0.2 stub. |
 
 Reading prices: report `bid_raw`/`ask_raw` as the REST price;
