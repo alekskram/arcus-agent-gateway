@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=oneshot
 # Universe = ACTIVE tradable tokens (~194); each tick fetches one quote per
 # symbol through the rate-limited client (50 req/s cap, ~0.65 req/s average).
-ExecStart=/usr/bin/env python -m scripts.recorder --once
+ExecStart=/usr/bin/env python -m arcus_mcp.recorder --once
 # Data lands in ~/.local/state/arcus-agent-gateway/history/ (override with
 # ARCUS_GATEWAY_DATA). Tick interval is owned by arcus-recorder.timer
 # (OnCalendar=*:0/5); set ARCUS_INTERVAL_SEC only for the long-running mode.

@@ -203,9 +203,11 @@ pip install "arcus-agent-gateway[recorder]"   # adds pyarrow (optional extra)
 sudo cp deploy/arcus-recorder.* /etc/systemd/system/
 sudo systemctl enable --now arcus-recorder.timer   # OnCalendar=*:0/5, Persistent
 # or run one tick / a debug loop manually:
-python scripts/recorder.py --once
-python scripts/recorder.py --limit 5            # debug: first 5 symbols only
-ARCUS_INTERVAL_SEC=60 python scripts/recorder.py  # custom interval loop
+python -m arcus_mcp.recorder --once
+python -m arcus_mcp.recorder --limit 5            # debug: first 5 symbols only
+ARCUS_INTERVAL_SEC=60 python -m arcus_mcp.recorder  # custom interval loop
+# (from a git checkout, `python scripts/recorder.py ...` still works -
+#  it is a thin shim that delegates to arcus_mcp.recorder)
 ```
 
 **Data weight & rotation.** Full universe (194 symbols) at a 5-minute tick ≈

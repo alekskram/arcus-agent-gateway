@@ -1136,7 +1136,7 @@ def build_server():
 
     mcp = FastMCP(
         "arcus-agent-gateway",
-        version="0.2.0",
+        version="0.2.1",
         instructions=(
             "Tokenized US equities on Robinhood Chain (Arcus DEX), "
             "read-only and keyless. Symbols come from token_list()/search() "
