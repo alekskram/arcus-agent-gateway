@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.1 (2026-09-04)
+
+- **tests/test_online.py**: opt-in online suite (7 live sanity checks:
+  quote, token_list, corporate_actions, holder_snapshot,
+  transfer_history, price_history degradation, market_status);
+  deselected by default via existing addopts, run with
+  `pytest tests/test_online.py -m online`; honest
+  skip-on-degradation, never a false fail. Not in CI by design.
+
 ## 0.2.0 (2026-09-04)
 
 On-chain layer: three new read-only tools reading the keyless public RPC
