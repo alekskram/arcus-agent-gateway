@@ -2,7 +2,9 @@
 
 Read-only, keyless market-data tools per the design spec: token_list, quote(s),
 token_detail, market_status, corporate_actions, search, sector_view,
-onchain_info. Sectors come from the static validated map in sectors.py.
+onchain_info; plus price_history (v0.1.1) reading the OPTIONAL local
+recorder's parquet files (honest degradation, no pyarrow -> no crash).
+Sectors come from the static validated map in sectors.py.
 
 Style follows dydx_mcp/server.py: plain functions registered via
 build_server() -> FastMCP, all annotated read-only. All upstream access
@@ -11,11 +13,18 @@ monkeypatch it - never `from .api import x`.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
 from . import api
+from . import paths
 from . import sectors
 
 TRADABLE = "TRADING_STATUS_TRADABLE"
 DEFAULT_PORT = 8902
+
+_QUOTES_CONCURRENCY = 8  # v0.1.1: in-flight quote() cap (see _quotes_async)
+_QUOTES_BATCH = 20       # max symbols per quotes() call (spec invariant)
 
 
 # ------------------------------------------------------------------ helpers
@@ -131,6 +140,29 @@ def _cached_quotes() -> dict[str, dict]:
                 for sym, entry in getattr(api, "_PRICES_CACHE", {}).items()}
 
 
+def _count_cold_prices(symbols) -> int:
+    """How many of `symbols` lack a fresh (TTL-valid) cached quote.
+
+    Mirrors api.prices()' own staleness check (monotonic timestamp +
+    api._PRICES_TTL) under api._CACHE_LOCK. This is the honest upper
+    bound on network requests a warm pass will make: every cache miss
+    means one api.prices() call, every hit means none (negative answers
+    never enter the cache, so they stay misses). No requests are made
+    here - pure cache inspection.
+    """
+    now = time.monotonic()
+    ttl = getattr(api, "_PRICES_TTL", 0.0)
+    syms = list(symbols)
+    with api._CACHE_LOCK:
+        cache = getattr(api, "_PRICES_CACHE", {})
+        hits = 0
+        for s in syms:
+            entry = cache.get((s or "").strip().upper())
+            if entry and now - entry[0] <= ttl:
+                hits += 1
+    return len(syms) - hits
+
+
 # ------------------------------------------------------------------- tools
 
 
@@ -217,15 +249,8 @@ def quote(symbol: str) -> dict:
     return out
 
 
-def quotes(symbols: list[str]) -> dict:
-    """Batch of quote() rows, up to 20 per call (more raises). Unknown
-    symbols do not fail the batch - they land in
-    errors: [{symbol, reason}] while the rest return normally.
-    Example: quotes(symbols=["AAPL", "MSFT", "NVDA"])"""
-    syms = [s for s in (symbols or []) if s and s.strip()]
-    if len(syms) > 20:
-        raise ValueError(
-            f"quotes: {len(syms)} symbols > 20 per call - split the batch")
+def _quotes_serial(syms: list[str]) -> dict:
+    """Order-preserving serial pass (fallback + reference semantics)."""
     out, errors = [], []
     for s in syms:
         try:
@@ -233,6 +258,67 @@ def quotes(symbols: list[str]) -> dict:
         except ValueError as e:  # unknown symbol: collect, don't fail batch
             errors.append({"symbol": s, "reason": str(e)})
     return {"quotes": out, "errors": errors}
+
+
+async def _quotes_async(syms: list[str]) -> dict:
+    """Parallel fan-out of quote() over `syms`, order-preserving.
+
+    Runs inside asyncio.run() from a plain worker thread (FastMCP runs
+    sync tools in a threadpool, so no loop is running here). Each
+    quote() is blocking, so it goes to the default ThreadPoolExecutor
+    via run_in_executor, capped at _QUOTES_CONCURRENCY (8) in flight by
+    a semaphore. gather(..., return_exceptions=True) keeps results
+    aligned with the input order: per-symbol ValueErrors (unknown
+    symbols) land in errors[], anything else re-raises and fails the
+    batch - exactly the serial semantics.
+    """
+    sem = asyncio.Semaphore(_QUOTES_CONCURRENCY)
+    loop = asyncio.get_running_loop()
+
+    async def _fetch(s: str):
+        async with sem:
+            return await loop.run_in_executor(None, quote, s)
+
+    results = await asyncio.gather(
+        *(asyncio.create_task(_fetch(s)) for s in syms),
+        return_exceptions=True)
+    out, errors = [], []
+    for s, res in zip(syms, results):
+        if isinstance(res, BaseException):
+            if isinstance(res, ValueError):  # unknown symbol: collect,
+                errors.append({"symbol": s, "reason": str(res)})  # go on
+            else:
+                raise res  # same rule as the serial pass: fail the batch
+        else:
+            out.append(res)
+    return {"quotes": out, "errors": errors}
+
+
+def quotes(symbols: list[str]) -> dict:
+    """Batch of quote() rows, up to 20 per call (more raises), fetched
+    in PARALLEL (v0.1.1): 8 quote() calls in flight at once, so 10
+    cold symbols complete in roughly one RTT instead of ten. Unknown
+    symbols do not fail the batch - they land in
+    errors: [{symbol, reason}] while the rest return normally, and the
+    output order matches the input order.
+    Example: quotes(symbols=["AAPL", "MSFT", "NVDA"])"""
+    syms = [s for s in (symbols or []) if s and s.strip()]
+    if len(syms) > _QUOTES_BATCH:
+        raise ValueError(
+            f"quotes: {len(syms)} symbols > {_QUOTES_BATCH} per call - "
+            "split the batch")
+    coro = _quotes_async(syms)
+    try:
+        # FastMCP runs sync tools in a threadpool: no loop in this
+        # thread, so asyncio.run is the way to fan out.
+        return asyncio.run(coro)
+    except RuntimeError as e:
+        if "running event loop" not in str(e):
+            raise  # a genuine upstream RuntimeError - let it through
+        coro.close()  # never started; silence "never awaited"
+        # Only if some host ever calls this sync tool on a loop thread:
+        # degrade to the serial pass rather than crash.
+        return _quotes_serial(syms)
 
 
 def token_detail(symbol: str) -> dict:
@@ -312,8 +398,10 @@ def market_status() -> dict:
 def _action_row(act: dict) -> dict:
     """Normalize one corporate action; tolerant to the field-name variants
     seen in the wild (type|actionType|kind, processDate|effectiveTime,
-    *From/*To/splitFrom/splitTo for the rates). `raw` keeps the original
-    untouched."""
+    *From/*To/splitFrom/splitTo for the rates). Cash dividends carry
+    details.cashDividend.rate (per-share amount, STRING) - surfaced as
+    details.rate; the API exposes no total cash amount (API_NOTES #5).
+    `raw` keeps the original untouched."""
     typ = next((act[k] for k in ("type", "actionType", "kind")
                 if act.get(k)), None)
     when = next((act[k] for k in ("processDate", "effectiveTime",
@@ -323,12 +411,15 @@ def _action_row(act: dict) -> dict:
                      if k.endswith("From") and _f(act[k]) is not None), None)
     new_rate = next((act[k] for k in sorted(act)
                      if k.endswith("To") and _f(act[k]) is not None), None)
+    cash = ((act.get("details") or {}).get("cashDividend") or {})
+    rate = cash.get("rate")
     return {
         "symbol": act.get("tokenSymbol"),
         "type": typ,
         "status": act.get("status"),
-        "process_date": when,
-        "details": {"old_rate": _f(old_rate), "new_rate": _f(new_rate)},
+        "process_date": _ts(when),
+        "details": {"old_rate": _f(old_rate), "new_rate": _f(new_rate),
+                    "rate": _f(rate)},
         "raw": act,
     }
 
@@ -344,12 +435,13 @@ def corporate_actions(symbol: str | None = None, limit: int = 10) -> dict:
     return {"actions": rows, "count": len(rows)}
 
 
-def search(query: str) -> dict:
+def search(query: str, limit: int = 10) -> dict:
     """Local fuzzy search over the token list - no HTTP beyond the cached
     assets(). Ranking: exact symbol > symbol prefix > name-word prefix >
-    substring in name/symbol (case-insensitive); top 10 with score.
+    substring in name/symbol (case-insensitive); top `limit` (default
+    10, cap 50) with score.
     'apple' -> AAPL. Results carry symbol, name, status, sector, score.
-    Example: search(query="apple")"""
+    Example: search(query="apple", limit=3)"""
     q = (query or "").strip().lower()
     if not q:
         return {"query": query, "results": [], "count": 0}
@@ -375,22 +467,19 @@ def search(query: str) -> dict:
             "sector": sectors.sector_of(sym),
             "score": score,
         }))
+    n = max(0, min(int(limit), 50))
     scored.sort(key=lambda t: (-t[0], t[1], t[2]))
-    top = [row for _, _, _, row in scored[:10]]
+    top = [row for _, _, _, row in scored[:n]]
     return {"query": query, "results": top, "count": len(top)}
 
 
-def sector_view() -> dict:
-    """Sector map (13 sectors, static validated classification) with
-    per-sector size and - where quotes are ALREADY cached - live
-    averages. Makes no requests: avg_bid_adjusted/avg_ask_adjusted are
-    None until quotes() has been called for that sector's symbols
-    (quoted counts how many are cached; usually 0 right after start).
-    halted lists cached-halted symbols per sector.
-    Example: sector_view()"""
+def _sector_rows(names: list[str]) -> dict[str, dict]:
+    """Per-sector size + cached-quote averages for the given sector
+    names (no requests - pure cache/assets join)."""
     cached = _cached_quotes()
     out: dict[str, dict] = {}
-    for name, syms in sectors.SECTORS.items():
+    for name in names:
+        syms = sectors.SECTORS.get(name, [])
         bids, asks, halted = [], [], []
         for s in syms:
             q = cached.get(s)
@@ -414,10 +503,54 @@ def sector_view() -> dict:
             if asks else None,
             "halted": halted,
         }
+    return out
+
+
+def sector_view(warm: bool = False, sector: str | None = None) -> dict:
+    """Sector map (13 sectors, static validated classification) with
+    per-sector size and live averages.
+
+    warm=False (default): cheap snapshot - averages appear only for
+    quotes ALREADY cached ('warmed': false; no requests made).
+    warm=True: fan out quotes() first (parallel batches of 20, upstream
+    rate-limit safe), then report - averages are live. With sector=
+    'Name' only that sector is fetched and returned; an unknown name
+    raises with the valid list. requests_made counts the price-cache
+    misses at the start of the warm pass (each miss = one upstream
+    request; fresh cache hits and cached-again symbols cost nothing).
+    Example: sector_view(warm=True, sector="Crypto/Digital Assets")"""
+    if warm:
+        if sector is not None:
+            syms = sectors.sector_symbols(sector)
+            if not syms:
+                valid = ", ".join(sectors.SECTORS)
+                raise ValueError(
+                    f"unknown sector {sector!r}. Valid sectors: {valid}")
+            names = [next(n for n in sectors.SECTORS
+                          if n.lower() == sector.strip().lower())]
+            targets = syms
+        else:
+            names = list(sectors.SECTORS)
+            targets = [s for syms in sectors.SECTORS.values() for s in syms]
+        requests_made = _count_cold_prices(targets)
+        for i in range(0, len(targets), _QUOTES_BATCH):
+            quotes(targets[i:i + _QUOTES_BATCH])
+        out = _sector_rows(names)
+        return {
+            "sectors": out,
+            "warmed": True,
+            "requests_made": requests_made,
+            "note": "warm pass fetched quotes in parallel batches of "
+                    f"{_QUOTES_BATCH} (requests_made = price-cache misses "
+                    "at start); averages are multiplier-adjusted",
+        }
+    out = _sector_rows(list(sectors.SECTORS))
     return {
         "sectors": out,
+        "warmed": False,
         "note": "call quotes([...sector symbols...]) first to populate "
-                "live averages (max 20 per call); averages are "
+                "live averages (max 20 per call), or sector_view("
+                "warm=True) to fetch them now; averages are "
                 "multiplier-adjusted",
     }
 
@@ -442,18 +575,109 @@ def onchain_info(symbol: str) -> dict:
     }
 
 
+# --------------------------------------------------------- price_history
+
+_DAILY_COLUMNS = ("symbol", "date", "open", "high", "low", "close", "volume")
+_RAW_COLUMNS = ("ts_utc", "symbol", "bid_raw", "ask_raw", "mid_adjusted",
+                "daily_volume", "multiplier", "is_halted")
+
+
+def _history_rows(table, columns: tuple[str, ...]) -> list[dict]:
+    """Parquet table -> list of plain dicts, one per row, pyarrow types
+    coerced to JSON-safe Python (bool stays bool, numbers -> float)."""
+    n = len(table)
+    cols = {name: table.column(name).to_pylist() if name in table.column_names
+            else [None] * n for name in columns}
+    # fill any column missing from an older file with None
+    return [{k: cols[k][i] for k in columns} for i in range(n)]
+
+
+def price_history(symbol: str, timeframe: str = "daily",
+                  limit: int = 90) -> dict:
+    """Historical prices recorded by the OPTIONAL local recorder
+    (scripts/recorder.py) - not a live API call. timeframe='daily':
+    OHLCV bars from history/daily.parquet (open/high/low/close are
+    multiplier-adjusted); timeframe='raw': every recorded snapshot
+    (bid/ask raw, mid_adjusted, multiplier, is_halted) from
+    history/snapshots_*.parquet. Rows are newest-first. The symbol is
+    NOT checked against token_list (the recorder writes the whole
+    universe; assets drift) - a symbol simply absent from the file
+    returns count 0. Degrades honestly instead of raising when the
+    optional pieces are missing: pyarrow absent -> error suggesting
+    'pip install arcus-agent-gateway[recorder]'; recorder never run /
+    no data yet -> error pointing at README § Optional price history
+    recorder. limit must be positive (daily capped at 200, raw at 500).
+    Example: price_history(symbol='AAPL', timeframe='daily', limit=30)"""
+    sym = (symbol or "").strip().upper()
+    if not sym:
+        raise ValueError("symbol required")
+    tf = (timeframe or "").strip().lower()
+    if tf not in ("daily", "raw"):
+        raise ValueError(
+            f"unknown timeframe {timeframe!r}: use 'daily' or 'raw'")
+    try:
+        n = int(limit)
+    except (TypeError, ValueError):
+        raise ValueError(f"limit must be positive, got {limit!r}")
+    if n <= 0:
+        raise ValueError("limit must be positive")
+    n = min(n, 200 if tf == "daily" else 500)
+    out: dict = {"symbol": sym, "timeframe": tf, "count": 0, "rows": []}
+    try:  # lazy: pyarrow ships only with the [recorder] extra
+        import pyarrow.parquet as pq
+    except ImportError:
+        out["error"] = ("pyarrow not installed - install "
+                        "arcus-agent-gateway[recorder] to enable price "
+                        "history")
+        out["hint"] = "README § Optional price history recorder"
+        return out
+
+    history = paths.data_dir() / "history"
+    files = ([history / "daily.parquet"] if tf == "daily"
+             else sorted(history.glob("snapshots_*.parquet")))
+    tables = []
+    for f in files:
+        try:
+            if f.exists():
+                tables.append(pq.read_table(f))
+        except Exception as exc:  # corrupt file: skip, don't crash
+            out.setdefault("warnings", []).append(
+                f"skipped unreadable {f.name}: {exc}")
+    if not tables:
+        out["error"] = ("recorder not enabled or no data yet - see README "
+                        "§ Optional price history recorder")
+        out["note"] = ("no snapshot files found; run the recorder "
+                       "(scripts/recorder.py) to start collecting"
+                       if tf == "raw" else
+                       "need >= 1 day of snapshots for daily bars; "
+                       "snapshots accumulate at the recorder interval "
+                       "(default 300s)")
+        return out
+    columns = _DAILY_COLUMNS if tf == "daily" else _RAW_COLUMNS
+    key = "date" if tf == "daily" else "ts_utc"
+    rows: list[dict] = []
+    for t in tables:
+        rows.extend(_history_rows(t, columns))
+    rows = [r for r in rows if r.get("symbol") == sym]
+    rows.sort(key=lambda r: r.get(key) or "", reverse=True)
+    out["rows"] = rows[:n]
+    out["count"] = len(out["rows"])
+    return out
+
+
 # --------------------------------------------------------------- MCP wire
 
 
 def build_server():
-    """FastMCP instance with the 9 read-only spec tools wired."""
+    """FastMCP instance with the 10 read-only tools wired (9 live-data
+    spec tools + price_history over the local recorder files)."""
     from fastmcp import FastMCP
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 
     mcp = FastMCP(
         "arcus-agent-gateway",
-        version="0.1.0",
+        version="0.1.1",
         instructions=(
             "Tokenized US equities on Robinhood Chain (Arcus DEX), "
             "read-only and keyless. Symbols come from token_list()/search() "
@@ -475,7 +699,8 @@ def build_server():
     RO = {"readOnlyHint": True, "destructiveHint": False,
           "openWorldHint": True}
     for tool in (token_list, quote, quotes, token_detail, market_status,
-                 corporate_actions, search, sector_view, onchain_info):
+                 corporate_actions, search, sector_view, onchain_info,
+                 price_history):
         mcp.tool(tool, annotations=RO)
     return mcp
 

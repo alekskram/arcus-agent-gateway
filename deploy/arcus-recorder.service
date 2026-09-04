@@ -1,0 +1,18 @@
+[Unit]
+Description=Arcus Agent Gateway - price history recorder (one snapshot tick)
+Documentation=file:///usr/share/doc/arcus-agent-gateway/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Universe = ACTIVE tradable tokens (~194); each tick fetches one quote per
+# symbol through the rate-limited client (50 req/s cap, ~0.65 req/s average).
+ExecStart=/usr/bin/env python -m scripts.recorder --once
+# Data lands in ~/.local/state/arcus-agent-gateway/history/ (override with
+# ARCUS_GATEWAY_DATA). Tick interval is owned by arcus-recorder.timer
+# (OnCalendar=*:0/5); set ARCUS_INTERVAL_SEC only for the long-running mode.
+# Requires the optional dependency: pip install arcus-agent-gateway[recorder]
+Environment=PYTHONUNBUFFERED=1
+# TimeoutBudget: a full-universe tick is ~194 requests ~ 20-60s worst case
+TimeoutStartSec=300

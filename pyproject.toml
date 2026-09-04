@@ -1,6 +1,6 @@
 [project]
 name = "arcus-agent-gateway"
-version = "0.1.0"
+version = "0.1.1"
 description = "MCP gateway for AI agents to Robinhood Chain (Arcus DEX) tokenized US equities: quotes, multipliers, corporate actions, market status, sectors. Read-only, keyless."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -27,6 +27,7 @@ Issues = "https://github.com/alekskram/arcus-agent-gateway/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "pip-audit"]
+recorder = ["pyarrow>=15"]
 
 [project.scripts]
 arcus-agent-gateway = "arcus_mcp.server:main"
