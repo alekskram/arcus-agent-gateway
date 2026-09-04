@@ -18,10 +18,15 @@ packages=["arcus_mcp"]` never ships `scripts/` (found on a live
   users: `python scripts/recorder.py --once` still works from a
   checkout and delegates to the package module; exits nonzero with
   the `[recorder]` install hint when `arcus_mcp` is not importable.
-- **examples/use-cases.md**: +3 on-chain scenarios (added separately
-  by teammates).
-- **tests/test_online.py**: online suite (added separately by
-  teammates).
+- **examples/use-cases.md**: +3 on-chain scenarios (holder
+  concentration, wallet portfolio, whale movements) with real
+  captured data from the live session of 2026-09-04.
+- **tests/test_online.py**: opt-in online suite (7 live sanity checks:
+  quote, token_list, corporate_actions, holder_snapshot,
+  transfer_history, price_history degradation, market_status);
+  deselected by default via existing addopts, run with
+  `pytest tests/test_online.py -m online`; honest
+  skip-on-degradation, never a false fail. Not in CI by design.
 - Version bumped to 0.2.1 (pyproject + FastMCP + `arcus_mcp.__version__`,
   which was stale at 0.1.0).
 
