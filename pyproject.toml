@@ -27,6 +27,7 @@ Issues = "https://github.com/mecorp/arcus-agent-gateway/issues"
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "pip-audit"]
+recorder = ["pyarrow>=15"]
 
 [project.scripts]
 arcus-agent-gateway = "arcus_mcp.server:main"
