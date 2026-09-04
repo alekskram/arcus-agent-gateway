@@ -72,8 +72,14 @@ def fake_call(to, data, block="latest"):
     return HEX_SUPPLY
 
 
+def fake_block_number():
+    return 5_451_380  # matches the stubbed walk-back to_block below
+
+
 def fake_get_transfers(contract, from_block, to_block=None):
     assert contract.lower() == AAPL_CONTRACT.lower()
+    # sane-cap invariant: from_block comes in as latest - 800
+    assert from_block == fake_block_number() - 800, from_block
     return {"logs": LOGS,
             "window": {"from_block": from_block, "to_block": 5451380,
                        "requests": 3, "widths_used": [48, 48, 32],
@@ -94,6 +100,7 @@ def main():
     explorer.token_holders = fake_holders
     explorer.address_token_balances = fake_balances
     rpc.call = fake_call
+    rpc.block_number = fake_block_number
     rpc.get_transfers = fake_get_transfers
     srv._HOLDINGS_CACHE.clear()
     srv._TRANSFERS_CACHE.clear()

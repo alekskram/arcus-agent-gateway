@@ -22,7 +22,7 @@ Pinned the spec invariants (see scripts/smoke_server_offline.py):
   (g) token_detail warnings on pendingMultiplier + effectiveTime
   (h) sector_view with cold cache: avg None + note
   (i) search('apple') -> AAPL first
-  (j) onchain_info: v0.2 stub note
+  (j) onchain_info: contract/chain/decimals/isin + warnings[] (v0.2 fields)
 """
 import asyncio
 import json

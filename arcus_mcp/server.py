@@ -38,6 +38,10 @@ _QUOTES_BATCH = 20       # max symbols per quotes() call (spec invariant)
 # caches its own pages (600s); these cover the joined/derived payloads.
 _HOLDINGS_TTL = 120.0    # wallet_holdings join of balances x universe
 _TRANSFERS_TTL = 60.0    # transfer_history normalized rows
+# Walk-back floor: latest - 800 blocks. The free RPC can only serve a
+# floating ~45-60-block window anyway; this cap just keeps the walker's
+# "budget" mode from pretending it might reach genesis.
+_TRANSFERS_LOOKBACK = 800
 _HOLDINGS_CACHE: dict[str, tuple[float, dict]] = {}
 _TRANSFERS_CACHE: dict[str, tuple[float, dict]] = {}
 _TOOL_CACHE_LOCK = threading.Lock()
@@ -913,14 +917,15 @@ def wallet_holdings(address: str) -> dict:
 def transfer_history(symbol: str, limit: int = 25,
                      min_value: float | None = None) -> dict:
     """Recent ERC-20 Transfer events for a token's contract, from the
-    public RPC's adaptive walk-back (windows start 48 blocks wide and
-    shrink 48->32->16->8 on archive-403s, ~14 getLogs requests max -
-    the free RPC only serves a floating ~45-60-block window). Rows
-    (newest first): ts (ISO-8601 from the log's own blockTimestamp),
-    from, to, value (float token units), tx_hash, block. min_value
-    filters in token units AFTER normalization. Results cached 60s.
-    When the walk-back window is exhausted with 0 logs, the note says
-    so and points at the explorer transfer list for older history.
+    public RPC's adaptive walk-back over the last ~800 blocks (windows
+    start 48 blocks wide and shrink 48->32->16->8 on archive-403s, ~14
+    getLogs requests max - the free RPC only serves a floating
+    ~45-60-block window). Rows (newest first): ts (ISO-8601 from the
+    log's own blockTimestamp), from, to, value (float token units),
+    tx_hash, block. min_value filters in token units AFTER
+    normalization. Results cached 60s. The note is honest about why the
+    walk stopped: 'window-closed' points at the explorer transfer list
+    for older history, 'budget' says the request cap was hit.
     Example: transfer_history(symbol="AAPL", limit=10, min_value=1.0)
     """
     a = _require_symbol(symbol)
@@ -937,7 +942,9 @@ def transfer_history(symbol: str, limit: int = 25,
         if cached and time.monotonic() - cached[0] <= _TRANSFERS_TTL:
             return cached[1]
     try:
-        walked = rpc.get_transfers(contract, 0)
+        latest = rpc.block_number()
+        walked = rpc.get_transfers(
+            contract, max(0, latest - _TRANSFERS_LOOKBACK), latest)
     except rpc.RpcError as e:
         return {"error": _err_dict(e.kind, f"transfers unavailable: {e}",
                                    hint="the free RPC window may have "
@@ -996,16 +1003,31 @@ def transfer_history(symbol: str, limit: int = 25,
         },
     }
     reason = win.get("stopped_reason")
+    notes: list[str] = []
     if not logs:
         if reason == "complete":
-            out["note"] = ("no Transfer logs in the fully covered window "
-                           f"({win.get('requests')} request(s))")
+            notes.append(f"no Transfer logs in the fully covered window "
+                         f"({win.get('requests')} request(s))")
+        elif reason == "budget":
+            notes.append(
+                "walk-back stopped at the ~14-request budget cap before "
+                "finding any logs; retry shortly or use explorer "
+                "/tokens/{contract}/transfers")
         else:
-            out["note"] = ("on-chain window reached; older transfers via "
-                           "explorer /tokens/{contract}/transfers")
-    elif len(rows) < len(logs):
-        out["note"] = (f"{len(logs) - len(rows)} transfer(s) below "
-                       f"min_value={mv} filtered out")
+            notes.append("on-chain window reached; older transfers via "
+                         "explorer /tokens/{contract}/transfers")
+    else:
+        if len(rows) < len(logs):
+            notes.append(f"{len(logs) - len(rows)} transfer(s) below "
+                         f"min_value={mv} filtered out")
+        if reason == "budget":
+            notes.append("history truncated: walk-back hit the "
+                         "~14-request budget cap")
+        elif reason == "window-closed":
+            notes.append("older transfers beyond the RPC window via "
+                         "explorer /tokens/{contract}/transfers")
+    if notes:
+        out["note"] = "; ".join(notes)
     with _TOOL_CACHE_LOCK:
         _TRANSFERS_CACHE[ck] = (time.monotonic(), out)
     return out
