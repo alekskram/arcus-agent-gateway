@@ -11,11 +11,17 @@ monkeypatch it - never `from .api import x`.
 """
 from __future__ import annotations
 
+import asyncio
+import time
+
 from . import api
 from . import sectors
 
 TRADABLE = "TRADING_STATUS_TRADABLE"
 DEFAULT_PORT = 8902
+
+_QUOTES_CONCURRENCY = 8  # MEC-57: in-flight quote() cap (see _quotes_async)
+_QUOTES_BATCH = 20       # max symbols per quotes() call (ТЗ invariant (д))
 
 
 # ------------------------------------------------------------------ helpers
@@ -131,6 +137,29 @@ def _cached_quotes() -> dict[str, dict]:
                 for sym, entry in getattr(api, "_PRICES_CACHE", {}).items()}
 
 
+def _count_cold_prices(symbols) -> int:
+    """How many of `symbols` lack a fresh (TTL-valid) cached quote.
+
+    Mirrors api.prices()' own staleness check (monotonic timestamp +
+    api._PRICES_TTL) under api._CACHE_LOCK. This is the honest upper
+    bound on network requests a warm pass will make: every cache miss
+    means one api.prices() call, every hit means none (negative answers
+    never enter the cache, so they stay misses). No requests are made
+    here - pure cache inspection.
+    """
+    now = time.monotonic()
+    ttl = getattr(api, "_PRICES_TTL", 0.0)
+    syms = list(symbols)
+    with api._CACHE_LOCK:
+        cache = getattr(api, "_PRICES_CACHE", {})
+        hits = 0
+        for s in syms:
+            entry = cache.get((s or "").strip().upper())
+            if entry and now - entry[0] <= ttl:
+                hits += 1
+    return len(syms) - hits
+
+
 # ------------------------------------------------------------------- tools
 
 
@@ -217,15 +246,8 @@ def quote(symbol: str) -> dict:
     return out
 
 
-def quotes(symbols: list[str]) -> dict:
-    """Batch of quote() rows, up to 20 per call (more raises). Unknown
-    symbols do not fail the batch - they land in
-    errors: [{symbol, reason}] while the rest return normally.
-    Example: quotes(symbols=["AAPL", "MSFT", "NVDA"])"""
-    syms = [s for s in (symbols or []) if s and s.strip()]
-    if len(syms) > 20:
-        raise ValueError(
-            f"quotes: {len(syms)} symbols > 20 per call - split the batch")
+def _quotes_serial(syms: list[str]) -> dict:
+    """Order-preserving serial pass (fallback + reference semantics)."""
     out, errors = [], []
     for s in syms:
         try:
@@ -233,6 +255,67 @@ def quotes(symbols: list[str]) -> dict:
         except ValueError as e:  # unknown symbol: collect, don't fail batch
             errors.append({"symbol": s, "reason": str(e)})
     return {"quotes": out, "errors": errors}
+
+
+async def _quotes_async(syms: list[str]) -> dict:
+    """Parallel fan-out of quote() over `syms`, order-preserving.
+
+    Runs inside asyncio.run() from a plain worker thread (FastMCP runs
+    sync tools in a threadpool, so no loop is running here). Each
+    quote() is blocking, so it goes to the default ThreadPoolExecutor
+    via run_in_executor, capped at _QUOTES_CONCURRENCY (8) in flight by
+    a semaphore. gather(..., return_exceptions=True) keeps results
+    aligned with the input order: per-symbol ValueErrors (unknown
+    symbols) land in errors[], anything else re-raises and fails the
+    batch - exactly the serial semantics.
+    """
+    sem = asyncio.Semaphore(_QUOTES_CONCURRENCY)
+    loop = asyncio.get_running_loop()
+
+    async def _fetch(s: str):
+        async with sem:
+            return await loop.run_in_executor(None, quote, s)
+
+    results = await asyncio.gather(
+        *(asyncio.create_task(_fetch(s)) for s in syms),
+        return_exceptions=True)
+    out, errors = [], []
+    for s, res in zip(syms, results):
+        if isinstance(res, BaseException):
+            if isinstance(res, ValueError):  # unknown symbol: collect,
+                errors.append({"symbol": s, "reason": str(res)})  # go on
+            else:
+                raise res  # same rule as the serial pass: fail the batch
+        else:
+            out.append(res)
+    return {"quotes": out, "errors": errors}
+
+
+def quotes(symbols: list[str]) -> dict:
+    """Batch of quote() rows, up to 20 per call (more raises), fetched
+    in PARALLEL (MEC-57): 8 quote() calls in flight at once, so 10
+    cold symbols complete in roughly one RTT instead of ten. Unknown
+    symbols do not fail the batch - they land in
+    errors: [{symbol, reason}] while the rest return normally, and the
+    output order matches the input order.
+    Example: quotes(symbols=["AAPL", "MSFT", "NVDA"])"""
+    syms = [s for s in (symbols or []) if s and s.strip()]
+    if len(syms) > _QUOTES_BATCH:
+        raise ValueError(
+            f"quotes: {len(syms)} symbols > {_QUOTES_BATCH} per call - "
+            "split the batch")
+    coro = _quotes_async(syms)
+    try:
+        # FastMCP runs sync tools in a threadpool: no loop in this
+        # thread, so asyncio.run is the way to fan out.
+        return asyncio.run(coro)
+    except RuntimeError as e:
+        if "running event loop" not in str(e):
+            raise  # a genuine upstream RuntimeError - let it through
+        coro.close()  # never started; silence "never awaited"
+        # Only if some host ever calls this sync tool on a loop thread:
+        # degrade to the serial pass rather than crash.
+        return _quotes_serial(syms)
 
 
 def token_detail(symbol: str) -> dict:
@@ -380,17 +463,13 @@ def search(query: str) -> dict:
     return {"query": query, "results": top, "count": len(top)}
 
 
-def sector_view() -> dict:
-    """Sector map (13 sectors, static validated classification) with
-    per-sector size and - where quotes are ALREADY cached - live
-    averages. Makes no requests: avg_bid_adjusted/avg_ask_adjusted are
-    None until quotes() has been called for that sector's symbols
-    (quoted counts how many are cached; usually 0 right after start).
-    halted lists cached-halted symbols per sector.
-    Example: sector_view()"""
+def _sector_rows(names: list[str]) -> dict[str, dict]:
+    """Per-sector size + cached-quote averages for the given sector
+    names (no requests - pure cache/assets join)."""
     cached = _cached_quotes()
     out: dict[str, dict] = {}
-    for name, syms in sectors.SECTORS.items():
+    for name in names:
+        syms = sectors.SECTORS.get(name, [])
         bids, asks, halted = [], [], []
         for s in syms:
             q = cached.get(s)
@@ -414,10 +493,54 @@ def sector_view() -> dict:
             if asks else None,
             "halted": halted,
         }
+    return out
+
+
+def sector_view(warm: bool = False, sector: str | None = None) -> dict:
+    """Sector map (13 sectors, static validated classification) with
+    per-sector size and live averages.
+
+    warm=False (default): cheap snapshot - averages appear only for
+    quotes ALREADY cached ('warmed': false; no requests made).
+    warm=True: fan out quotes() first (parallel batches of 20, upstream
+    rate-limit safe), then report - averages are live. With sector=
+    'Name' only that sector is fetched and returned; an unknown name
+    raises with the valid list. requests_made counts the price-cache
+    misses at the start of the warm pass (each miss = one upstream
+    request; fresh cache hits and cached-again symbols cost nothing).
+    Example: sector_view(warm=True, sector="Crypto/Digital Assets")"""
+    if warm:
+        if sector is not None:
+            syms = sectors.sector_symbols(sector)
+            if not syms:
+                valid = ", ".join(sectors.SECTORS)
+                raise ValueError(
+                    f"unknown sector {sector!r}. Valid sectors: {valid}")
+            names = [next(n for n in sectors.SECTORS
+                          if n.lower() == sector.strip().lower())]
+            targets = syms
+        else:
+            names = list(sectors.SECTORS)
+            targets = [s for syms in sectors.SECTORS.values() for s in syms]
+        requests_made = _count_cold_prices(targets)
+        for i in range(0, len(targets), _QUOTES_BATCH):
+            quotes(targets[i:i + _QUOTES_BATCH])
+        out = _sector_rows(names)
+        return {
+            "sectors": out,
+            "warmed": True,
+            "requests_made": requests_made,
+            "note": "warm pass fetched quotes in parallel batches of "
+                    f"{_QUOTES_BATCH} (requests_made = price-cache misses "
+                    "at start); averages are multiplier-adjusted",
+        }
+    out = _sector_rows(list(sectors.SECTORS))
     return {
         "sectors": out,
+        "warmed": False,
         "note": "call quotes([...sector symbols...]) first to populate "
-                "live averages (max 20 per call); averages are "
+                "live averages (max 20 per call), or sector_view("
+                "warm=True) to fetch them now; averages are "
                 "multiplier-adjusted",
     }
 
