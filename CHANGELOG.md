@@ -12,7 +12,9 @@
   rollup (`volume` = max of cumulative daily volume). pyarrow is an optional
   `[recorder]` extra; systemd units ship in `deploy/` **disabled**.
 - **Parallel quotes**: `quotes()` fans out with an asyncio semaphore (8
-  concurrent); 10 cold symbols ≈ 0.6–1 s (was ~3.1 s serialized). Global
+  concurrent); 10 cold symbols ≈ 0.3–0.4 s typical (was ~3.1 s serialized;
+  live-verified 2026-09-04). An occasional upstream 429 under the burst
+  costs one 2 s backoff retry - all results still returned. Global
   50 req/s client cap unchanged.
 - **search() limit** parameter (default 10, cap 50).
 - **sector_view(warm=False, sector=None)**: `warm=True` fans out fresh
