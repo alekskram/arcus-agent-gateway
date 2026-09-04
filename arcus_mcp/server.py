@@ -2,22 +2,30 @@
 
 Read-only, keyless market-data tools per the design spec: token_list, quote(s),
 token_detail, market_status, corporate_actions, search, sector_view,
-onchain_info; plus price_history (v0.1.1) reading the OPTIONAL local
-recorder's parquet files (honest degradation, no pyarrow -> no crash).
-Sectors come from the static validated map in sectors.py.
+onchain_info; price_history (v0.1.1) reading the OPTIONAL local
+recorder's parquet files (honest degradation, no pyarrow -> no crash);
+and the v0.2 on-chain trio holder_snapshot / wallet_holdings /
+transfer_history reading the public RPC (rpc.py) and the Blockscout
+explorer (explorer.py) with per-field source tags and honest
+degradation. Sectors come from the static validated map in sectors.py.
 
 Style follows dydx_mcp/server.py: plain functions registered via
 build_server() -> FastMCP, all annotated read-only. All upstream access
-goes through the `api` module namespace (api.assets() etc.) so tests can
-monkeypatch it - never `from .api import x`.
+goes through the `api` / `rpc` / `explorer` module namespaces
+(api.assets() etc.) so tests can monkeypatch them - never
+`from .api import x`.
 """
 from __future__ import annotations
 
 import asyncio
+import re
+import threading
 import time
 
 from . import api
+from . import explorer
 from . import paths
+from . import rpc
 from . import sectors
 
 TRADABLE = "TRADING_STATUS_TRADABLE"
@@ -25,6 +33,21 @@ DEFAULT_PORT = 8902
 
 _QUOTES_CONCURRENCY = 8  # v0.1.1: in-flight quote() cap (see _quotes_async)
 _QUOTES_BATCH = 20       # max symbols per quotes() call (spec invariant)
+
+# Tool-level result caches (monotonic ts -> payload). The explorer client
+# caches its own pages (600s); these cover the joined/derived payloads.
+_HOLDINGS_TTL = 120.0    # wallet_holdings join of balances x universe
+_TRANSFERS_TTL = 60.0    # transfer_history normalized rows
+# Walk-back floor: latest - 800 blocks. The free RPC can only serve a
+# floating ~45-60-block window anyway; this cap just keeps the walker's
+# "budget" mode from pretending it might reach genesis.
+_TRANSFERS_LOOKBACK = 800
+_HOLDINGS_CACHE: dict[str, tuple[float, dict]] = {}
+_TRANSFERS_CACHE: dict[str, tuple[float, dict]] = {}
+_TOOL_CACHE_LOCK = threading.Lock()
+
+_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
+_TOTAL_SUPPLY_DATA = "0x18160ddd"  # keccak("totalSupply()") selector
 
 
 # ------------------------------------------------------------------ helpers
@@ -555,24 +578,459 @@ def sector_view(warm: bool = False, sector: str | None = None) -> dict:
     }
 
 
+# ------------------------------------------------------------- on-chain v0.2
+
+
+def _err_dict(kind: str, message: str, hint: str | None = None) -> dict:
+    """Flat error row for warnings[]/error fields (kind + hint, never silent)."""
+    return {"kind": kind, "message": message, "hint": hint or ""}
+
+
+def _contract_of(a: dict) -> str | None:
+    """First deployment contract address, or None."""
+    dep = (a.get("deployments") or [{}])[0]
+    return dep.get("contractAddress")
+
+
+def _rpc_total_supply(contract: str) -> float | None:
+    """totalSupply() via eth_call /1e18; None on any failure (caller warns)."""
+    try:
+        raw = rpc.call(contract, _TOTAL_SUPPLY_DATA)
+        return int(raw, 16) / 10**18
+    except (rpc.RpcError, ValueError, TypeError):
+        return None
+
+
+def _explorer_token_row(contract: str, warnings: list) -> dict | None:
+    """explorer.token() row or None + independent-failure warning."""
+    try:
+        return explorer.token(contract)
+    except explorer.ExplorerError as e:
+        warnings.append(_err_dict(
+            "explorer", f"holders/mcap unavailable: {e}",
+            hint=e.hint or "explorer is the only source for these fields"))
+        return None
+
+
 def onchain_info(symbol: str) -> dict:
-    """On-chain footprint of a token: contract address, chain id (4663,
-    Robinhood Chain), network, decimals and ISIN. v0.2 stub - full
-    on-chain data (balances via eth_call, Transfer/Split history via
-    getLogs against an Alchemy endpoint) is planned for v0.2.
-    Example: onchain_info(symbol="AAPL")"""
+    """On-chain footprint of a token, joined from three independent
+    sources (each fails to a warning, never silently):
+
+      * REST metadata: contract, chain_id, network, decimals, isin
+      * RPC (publicnode eth_call): total_supply = totalSupply()/1e18
+      * explorer (Blockscout): holders_count, circulating_market_cap
+
+    supply_crosscheck compares the REST-implied capitalization
+    (total_supply * multiplier * quote mid) with the explorer's
+    circulating_market_cap; a >1% divergence lands in warnings[] (both
+    values still returned). Every derived field carries a per-field
+    "source" tag ("rpc" | "explorer" | "rest"). Example:
+    onchain_info(symbol="AAPL")"""
     a = _require_symbol(symbol)
     dep = (a.get("deployments") or [{}])[0]
-    return {
+    contract = dep.get("contractAddress")
+    chain_id = dep.get("chainId")
+    if isinstance(chain_id, str):  # numeric-string drift -> float, else raw
+        chain_id = _f(chain_id)
+    warnings: list = []
+    out: dict = {
         "symbol": a.get("tokenSymbol"),
-        "contract": dep.get("contractAddress"),
-        "chain_id": dep.get("chainId"),
+        "contract": contract,
+        "chain_id": chain_id,
         "network": dep.get("networkName"),
         "decimals": a.get("tokenDecimals"),
         "isin": a.get("isin"),
-        "note": "Full on-chain data (Alchemy eth_call/getLogs) planned "
-                "for v0.2",
     }
+
+    # ---- rpc: total_supply (source "rpc")
+    total_supply: float | None = None
+    if contract:
+        total_supply = _rpc_total_supply(contract)
+        if total_supply is None:
+            warnings.append(_err_dict(
+                "rpc", "total_supply unavailable: eth_call totalSupply() "
+                "failed on the public RPC",
+                hint="retry, or read the explorer-supplied supply"))
+        if total_supply is not None:
+            out["total_supply"] = round(total_supply, 6)
+            out["total_supply_source"] = "rpc"
+
+    # ---- explorer: holders_count + circulating_market_cap
+    tok = _explorer_token_row(contract, warnings) if contract else None
+    if tok is not None:
+        holders = _f(tok.get("holders_count"))
+        mcap = _f(tok.get("circulating_market_cap"))
+        if holders is not None:
+            out["holders_count"] = int(holders)
+            out["holders_count_source"] = "explorer"
+        else:
+            warnings.append(_err_dict(
+                "explorer", "holders_count missing in explorer token row"))
+        if mcap is not None:
+            out["circulating_market_cap"] = mcap
+            out["circulating_market_cap_source"] = "explorer"
+        else:
+            warnings.append(_err_dict(
+                "explorer", "circulating_market_cap missing in explorer "
+                "token row"))
+    elif not contract:
+        warnings.append(_err_dict(
+            "rest", "no deployment/contract address on the asset row",
+            hint="on-chain fields need a contract; call token_detail()"))
+
+    # ---- supply crosscheck: REST price x multiplier vs explorer mcap
+    out["supply_crosscheck"] = _supply_crosscheck(
+        a, total_supply, tok, warnings)
+    out["warnings"] = warnings
+    return out
+
+
+def _supply_crosscheck(a: dict, total_supply: float | None,
+                       tok: dict | None, warnings: list) -> dict:
+    """Cross-check REST-implied capitalization vs the explorer's.
+
+    rest_implied = total_supply * multiplier * quote.mid (rpc + REST);
+    explorer_implied = circulating_market_cap, or total_supply *
+    exchange_rate when the cap is missing. A >1% relative divergence
+    lands in warnings[] (both values still returned for inspection).
+    """
+    row: dict = {"checked": False}
+    if total_supply is None:
+        row["note"] = "no rpc total_supply - nothing to cross-check"
+        return row
+    row["total_supply"] = round(total_supply, 6)
+    mult = _multiplier_block(a)["current"]
+    row["multiplier"] = mult
+    sym = a.get("tokenSymbol") or ""
+    mid = None
+    try:
+        p = api.prices(sym)
+        if p is not None:
+            bid, ask = _f(p.get("bid")), _f(p.get("ask"))
+            if bid is not None and ask is not None:
+                mid = (bid + ask) / 2
+    except (ValueError, RuntimeError):
+        mid = None
+    if mid is None:
+        row["note"] = "no REST quote - cross-check skipped (not an error)"
+        return row
+    row["mid_price"] = mid
+    rest_implied = total_supply * mult * mid
+    row["rest_implied_usd"] = round(rest_implied, 2)
+    expl_implied = None
+    if tok is not None:
+        cap = _f(tok.get("circulating_market_cap"))
+        rate = _f(tok.get("exchange_rate"))
+        expl_implied = cap if cap is not None else (
+            total_supply * rate if rate is not None else None)
+        if expl_implied is not None:
+            row["explorer_implied_usd"] = round(expl_implied, 2)
+    if expl_implied is None:
+        row["note"] = ("explorer cap unavailable - one-sided check only "
+                       "(rest_implied_usd present)")
+        return row
+    if expl_implied <= 0:
+        row["note"] = "explorer implied value non-positive - check skipped"
+        return row
+    divergence = abs(rest_implied - expl_implied) / expl_implied
+    row["divergence_pct"] = round(divergence * 100, 4)
+    row["checked"] = True
+    if divergence > 0.01:
+        warnings.append(
+            f"supply cross-check divergence {divergence * 100:.2f}% "
+            f"(REST-implied ${rest_implied:,.0f} vs explorer-implied "
+            f"${expl_implied:,.0f}) - >1%: rest price, multiplier or "
+            f"explorer cap may be stale")
+    return row
+
+
+def holder_snapshot(symbol: str, limit: int = 20) -> dict:
+    """Top holders of a token's contract from the explorer (one page,
+    max 50 rows, cached 600s inside the explorer client). Each row:
+    address, value (float token units, raw/1e18), share_pct
+    (= value / total_supply * 100) and is_contract. total_supply comes
+    from the RPC totalSupply() call, falling back to the explorer's own
+    token row when the RPC is unavailable (source-tagged either way).
+    Explorer/RPC failures return an error dict with kind + hint, never
+    a silent empty list. Example: holder_snapshot(symbol="AAPL", limit=10)
+    """
+    a = _require_symbol(symbol)
+    contract = _contract_of(a)
+    if not contract:
+        return {"error": _err_dict(
+            "rest", f"asset {a.get('tokenSymbol')!r} has no deployed "
+            "contract address", hint="on-chain tools need a contract")}
+    try:
+        page = explorer.token_holders(contract, limit=limit)
+    except explorer.ExplorerError as e:
+        return {"error": _err_dict(e.kind, f"holders unavailable: {e}",
+                                   hint=e.hint)}
+    if page is None:
+        return {"error": _err_dict(
+            "explorer", "token unknown to the explorer (404)",
+            hint="contract may not be indexed; try onchain_info() first")}
+    warnings: list = []
+    supply = _rpc_total_supply(contract)
+    supply_source = "rpc"
+    if supply is None:
+        warnings.append(_err_dict(
+            "rpc", "totalSupply() eth_call failed - falling back to the "
+            "explorer supply"))
+        try:
+            tok = explorer.token(contract)
+            raw_supply = _f(tok.get("total_supply")) if tok is not None \
+                else None
+            supply = (raw_supply / 10**18
+                      if raw_supply is not None else None)
+        except explorer.ExplorerError as e:
+            warnings.append(_err_dict(
+                "explorer", f"explorer supply fallback failed: {e}",
+                hint=e.hint))
+            supply = None
+        supply_source = "explorer" if supply is not None else "none"
+    n = max(1, min(50, int(limit)))
+    rows: list = []
+    for it in (page.get("items") or [])[:n]:
+        raw = _f(it.get("value"))
+        value = raw / 10**18 if raw is not None else None
+        share = (round(value / supply * 100, 6)
+                 if value is not None and supply else None)
+        rows.append({
+            "address": it.get("address"),
+            "value": round(value, 6) if value is not None else None,
+            "share_pct": share,
+            "is_contract": bool(it.get("is_contract")),
+        })
+    out: dict = {
+        "symbol": a.get("tokenSymbol"),
+        "contract": contract,
+        "count": len(rows),
+        "holders": rows,
+        "total_supply": round(supply, 6) if supply else None,
+        "total_supply_source": supply_source,
+    }
+    if supply is None:
+        warnings.append(_err_dict(
+            "rpc", "no total_supply from either source - share_pct is "
+            "null on every row",
+            hint="retry later; explorer holders themselves are fresh"))
+    if page.get("next_page_params") is not None:
+        out["next_page"] = True
+        out["note"] = ("page capped at 50 rows by design (no pagination "
+                       "loops); more holders exist beyond this page")
+    if warnings:
+        out["warnings"] = warnings
+    return out
+
+
+def wallet_holdings(address: str) -> dict:
+    """Which tokenized equities (out of the assets() universe) a wallet
+    holds, from the explorer's address token-balances. The universe
+    join is case-insensitive on the contract address; rows: symbol,
+    name, value (float token units, raw/1e18). est_position_usd and
+    portfolio_usd_total are computed ONLY from quotes already in the
+    price cache (no quote fan-out); when quotes are missing or stale a
+    note says so instead of faking numbers. Results cached 120s.
+    Example: wallet_holdings(
+        address="0x8366a39CC670B4001A1121B8F6A443A643e40951")"""
+    addr = (address or "").strip()
+    if not _ADDRESS_RE.match(addr):
+        raise ValueError(
+            f"not a wallet address: {address!r} - expected 0x + 40 hex "
+            "chars")
+    key = addr.lower()
+    with _TOOL_CACHE_LOCK:
+        cached = _HOLDINGS_CACHE.get(key)
+        if cached and time.monotonic() - cached[0] <= _HOLDINGS_TTL:
+            return cached[1]
+    try:
+        balances = explorer.address_token_balances(addr)
+    except explorer.ExplorerError as e:
+        return {"error": _err_dict(e.kind, f"balances unavailable: {e}",
+                                   hint=e.hint)}
+    if balances is None:
+        return {"error": _err_dict(
+            "explorer", "address unknown to the explorer (404)",
+            hint="check the address on the explorer site")}
+    universe = {
+        ((a.get("deployments") or [{}])[0].get("contractAddress") or "")
+        .lower(): a
+        for a in api.assets()
+        if (a.get("deployments") or [{}])[0].get("contractAddress")}
+    cached_quotes = _cached_quotes()
+    now = time.monotonic()
+    ttl = getattr(api, "_PRICES_TTL", 0.0)
+    with api._CACHE_LOCK:  # snapshot ts freshness per symbol
+        entry_ts = {sym: e[0] for sym, e in
+                    getattr(api, "_PRICES_CACHE", {}).items()}
+    rows: list = []
+    portfolio = 0.0
+    priced = 0
+    unpriced: list[str] = []
+    for b in balances or []:
+        tok = b.get("token") or {}
+        asset = universe.get((tok.get("address_hash") or "").lower())
+        if asset is None:
+            continue  # not one of our tokenized equities
+        raw = _f(b.get("value"))
+        value = raw / 10**18 if raw is not None else None
+        sym = asset.get("tokenSymbol")
+        price = cached_quotes.get(sym)
+        est = None
+        if value is not None and price is not None:
+            ts = entry_ts.get(sym)
+            if ts is not None and now - ts <= ttl:
+                bid, ask = _f(price.get("bid")), _f(price.get("ask"))
+                m = _multiplier_block(asset)["current"]
+                if bid is not None and ask is not None:
+                    est = round(value * (bid + ask) / 2 * m, 2)
+        if est is not None:
+            portfolio += est
+            priced += 1
+        else:
+            unpriced.append(sym)
+        rows.append({
+            "symbol": sym,
+            "name": asset.get("tokenName"),
+            "value": round(value, 6) if value is not None else None,
+            "est_position_usd": est,
+        })
+    rows.sort(key=lambda r: -(r.get("est_position_usd")
+                              or r.get("value") or 0))
+    out: dict = {
+        "address": addr,
+        "count": len(rows),
+        "holdings": rows,
+        "portfolio_usd_total": round(portfolio, 2) if priced else None,
+        "priced_positions": priced,
+    }
+    if unpriced:
+        out["note"] = (f"est_position_usd omitted for {len(unpriced)} "
+                       "position(s) with no FRESH cached quote (cache-only "
+                       "pricing, no fan-out; call quotes() on those "
+                       "symbols first)")
+    with _TOOL_CACHE_LOCK:
+        _HOLDINGS_CACHE[key] = (time.monotonic(), out)
+    return out
+
+
+def transfer_history(symbol: str, limit: int = 25,
+                     min_value: float | None = None) -> dict:
+    """Recent ERC-20 Transfer events for a token's contract, from the
+    public RPC's adaptive walk-back over the last ~800 blocks (windows
+    start 48 blocks wide and shrink 48->32->16->8 on archive-403s, ~14
+    getLogs requests max - the free RPC only serves a floating
+    ~45-60-block window). Rows (newest first): ts (ISO-8601 from the
+    log's own blockTimestamp), from, to, value (float token units),
+    tx_hash, block. min_value filters in token units AFTER
+    normalization. Results cached 60s. The note is honest about why the
+    walk stopped: 'window-closed' points at the explorer transfer list
+    for older history, 'budget' says the request cap was hit.
+    Example: transfer_history(symbol="AAPL", limit=10, min_value=1.0)
+    """
+    a = _require_symbol(symbol)
+    contract = _contract_of(a)
+    if not contract:
+        return {"error": _err_dict(
+            "rest", f"asset {a.get('tokenSymbol')!r} has no deployed "
+            "contract address", hint="on-chain tools need a contract")}
+    n = max(1, min(100, int(limit)))
+    mv = None if min_value is None else float(min_value)
+    ck = f"{contract.lower()}|{n}|{mv}"
+    with _TOOL_CACHE_LOCK:
+        cached = _TRANSFERS_CACHE.get(ck)
+        if cached and time.monotonic() - cached[0] <= _TRANSFERS_TTL:
+            return cached[1]
+    try:
+        latest = rpc.block_number()
+        walked = rpc.get_transfers(
+            contract, max(0, latest - _TRANSFERS_LOOKBACK), latest)
+    except rpc.RpcError as e:
+        return {"error": _err_dict(e.kind, f"transfers unavailable: {e}",
+                                   hint="the free RPC window may have "
+                                        "drifted; retry shortly")}
+    logs = walked.get("logs") or []
+    win = walked.get("window") or {}
+    rows: list = []
+    for log in logs:
+        data = log.get("data") or ""
+        try:
+            units = int(data, 16) if data.startswith("0x") else int(data)
+        except ValueError:
+            units = None
+        value = units / 10**18 if units is not None else None
+        if mv is not None and (value is None or value < mv):
+            continue
+        topics = log.get("topics") or []
+        frm = ("0x" + topics[1][-40:] if len(topics) > 1
+               and len(topics[1]) >= 42 else None)
+        to = ("0x" + topics[2][-40:] if len(topics) > 2
+              and len(topics[2]) >= 42 else None)
+        ts_raw = log.get("blockTimestamp")
+        ts = None
+        if isinstance(ts_raw, str) and ts_raw.startswith("0x"):
+            try:
+                ts = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                   time.gmtime(int(ts_raw, 16)))
+            except ValueError:
+                ts = None
+        elif isinstance(ts_raw, str) and ts_raw.isdigit():
+            ts = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                               time.gmtime(int(ts_raw)))
+        bn = log.get("blockNumber")
+        rows.append({
+            "ts": ts,
+            "from": frm,
+            "to": to,
+            "value": round(value, 6) if value is not None else None,
+            "tx_hash": log.get("transactionHash"),
+            "block": (int(bn, 16) if isinstance(bn, str)
+                      and bn.startswith("0x") else bn),
+        })
+    rows.sort(key=lambda r: ((r.get("block") or 0),
+                             r.get("tx_hash") or ""), reverse=True)
+    rows = rows[:n]
+    out: dict = {
+        "symbol": a.get("tokenSymbol"),
+        "contract": contract,
+        "count": len(rows),
+        "transfers": rows,
+        "window": {
+            "requests": win.get("requests"),
+            "stopped_reason": win.get("stopped_reason"),
+            "oldest_covered": win.get("oldest_covered"),
+            "newest_covered": win.get("newest_covered"),
+        },
+    }
+    reason = win.get("stopped_reason")
+    notes: list[str] = []
+    if not logs:
+        if reason == "complete":
+            notes.append(f"no Transfer logs in the fully covered window "
+                         f"({win.get('requests')} request(s))")
+        elif reason == "budget":
+            notes.append(
+                "walk-back stopped at the ~14-request budget cap before "
+                "finding any logs; retry shortly or use explorer "
+                "/tokens/{contract}/transfers")
+        else:
+            notes.append("on-chain window reached; older transfers via "
+                         "explorer /tokens/{contract}/transfers")
+    else:
+        if len(rows) < len(logs):
+            notes.append(f"{len(logs) - len(rows)} transfer(s) below "
+                         f"min_value={mv} filtered out")
+        if reason == "budget":
+            notes.append("history truncated: walk-back hit the "
+                         "~14-request budget cap")
+        elif reason == "window-closed":
+            notes.append("older transfers beyond the RPC window via "
+                         "explorer /tokens/{contract}/transfers")
+    if notes:
+        out["note"] = "; ".join(notes)
+    with _TOOL_CACHE_LOCK:
+        _TRANSFERS_CACHE[ck] = (time.monotonic(), out)
+    return out
 
 
 # --------------------------------------------------------- price_history
@@ -669,15 +1127,16 @@ def price_history(symbol: str, timeframe: str = "daily",
 
 
 def build_server():
-    """FastMCP instance with the 10 read-only tools wired (9 live-data
-    spec tools + price_history over the local recorder files)."""
+    """FastMCP instance with the 13 read-only tools wired (market-data
+    spec tools + price_history + the v0.2 on-chain trio reading the
+    public RPC and the block explorer)."""
     from fastmcp import FastMCP
     from starlette.requests import Request
     from starlette.responses import JSONResponse
 
     mcp = FastMCP(
         "arcus-agent-gateway",
-        version="0.1.1",
+        version="0.2.0",
         instructions=(
             "Tokenized US equities on Robinhood Chain (Arcus DEX), "
             "read-only and keyless. Symbols come from token_list()/search() "
@@ -700,6 +1159,7 @@ def build_server():
           "openWorldHint": True}
     for tool in (token_list, quote, quotes, token_detail, market_status,
                  corporate_actions, search, sector_view, onchain_info,
+                 holder_snapshot, wallet_holdings, transfer_history,
                  price_history):
         mcp.tool(tool, annotations=RO)
     return mcp

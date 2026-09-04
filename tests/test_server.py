@@ -22,7 +22,7 @@ Pinned the spec invariants (see scripts/smoke_server_offline.py):
   (g) token_detail warnings on pendingMultiplier + effectiveTime
   (h) sector_view with cold cache: avg None + note
   (i) search('apple') -> AAPL first
-  (j) onchain_info: v0.2 stub note
+  (j) onchain_info: contract/chain/decimals/isin + warnings[] (v0.2 fields)
 """
 import asyncio
 import json
@@ -464,7 +464,9 @@ def test_onchain_info_stub_fields(mock_api):
     assert oc["network"] == "Robinhood Chain"
     assert oc["decimals"] == 18
     assert oc["isin"] == AAPL_ASSET["isin"]
-    assert "v0.2" in oc["note"]
+    # v0.2: the stub note is gone; degradation now surfaces via warnings[]
+    assert "note" not in oc
+    assert isinstance(oc["warnings"], list)
 
 
 def test_onchain_info_unknown_symbol(mock_api):
@@ -476,7 +478,8 @@ def test_onchain_info_unknown_symbol(mock_api):
 
 EXPECTED_TOOLS = {"token_list", "quote", "quotes", "token_detail",
                   "market_status", "corporate_actions", "search",
-                  "sector_view", "onchain_info", "price_history"}
+                  "sector_view", "onchain_info", "holder_snapshot",
+                  "wallet_holdings", "transfer_history", "price_history"}
 
 
 def test_build_server_registers_exactly_ten_readonly_tools(mock_api):
