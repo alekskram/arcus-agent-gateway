@@ -12,6 +12,16 @@ access to market data for the **194 tokenized US equities** on **Robinhood Chain
 public `api.robinhood.com/rhj` REST surface, cached and rate-limited so an
 enthusiastic agent can't hammer the upstream.
 
+## Use cases
+
+- **"Who actually holds AAPL?"** — top holders with on-chain share %, contract vs EOA, concentration risk ([holder_snapshot scenario](examples/use-cases.md))
+- **Watch any wallet** — full portfolio across all 194 tokenized equities, valued at cached quotes (`wallet_holdings`)
+- **Catch whale moves** — live ERC-20 Transfer feed with a `min_value` filter for large-print alerts (`transfer_history`)
+- **Split-safe prices** — raw vs multiplier-adjusted quotes side by side, pending-split warnings with effective time (`quote`, `token_detail`)
+- **Morning scan** — market-wide health, halted tokens and 13-sector averages in two cheap calls (`market_status`, `sector_view(warm=True)`)
+
+Full walkthroughs with real outputs: [examples/use-cases.md](examples/use-cases.md).
+
 ## Quickstart
 
 Run over stdio (the default, for local agents):
@@ -20,8 +30,7 @@ Run over stdio (the default, for local agents):
 uvx arcus-agent-gateway
 ```
 
-Claude Desktop / Cursor config (`claude_desktop_config.json` or
-`.cursor/mcp.json`):
+Standard config for Claude Desktop / Cursor (`claude_desktop_config.json` / `.cursor/mcp.json`):
 
 ```json
 {
@@ -34,15 +43,18 @@ Claude Desktop / Cursor config (`claude_desktop_config.json` or
 }
 ```
 
-**Codex** (`~/.codex/config.toml`):
+<details>
+<summary><b>Codex</b> (~/.codex/config.toml)</summary>
 
 ```toml
 [mcp_servers.arcus]
 command = "uvx"
 args = ["arcus-agent-gateway"]
 ```
+</details>
 
-**ZCode** — register the server and copy the agent skill (all copy-paste):
+<details>
+<summary><b>ZCode</b> — register the server and copy the agent skill (copy-paste)</summary>
 
 ```bash
 # 1) start the gateway (keep it running)
@@ -65,6 +77,7 @@ git clone -q --depth 1 https://github.com/alekskram/arcus-agent-gateway /tmp/aag
 cp -r /tmp/aag/.agents/skills/arcus-gateway ~/.zcode/skills/ && rm -rf /tmp/aag
 echo "ZCode setup done — restart your session and call any arcus tool"
 ```
+</details>
 
 Hosted form — streamable HTTP on port **8902**:
 
@@ -220,3 +233,17 @@ snapshots from the same directory. Without pyarrow or data it returns an
 actionable error pointing here — install the `[recorder]` extra, never a
 silent empty answer.
 
+## Security & privacy
+
+- **Keyless and read-only.** No API keys, no auth, no writes. Every tool is
+  annotated `readOnlyHint: true` / `destructiveHint: false` on the MCP wire.
+- **Rate-limited by design.** Client caps at 50 req/s against the public REST
+  surface, public RPC requests go through the same limiter, Blockscout calls
+  carry a standard browser User-Agent and their own timeouts.
+- **No telemetry, no logging of your prompts.** The server caches public
+  market data in memory (and parquet files only if you enable the optional
+  recorder); nothing leaves your machine except the API reads themselves.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Not affiliated with Robinhood Markets, Inc.
