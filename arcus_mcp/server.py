@@ -24,7 +24,7 @@ TRADABLE = "TRADING_STATUS_TRADABLE"
 DEFAULT_PORT = 8902
 
 _QUOTES_CONCURRENCY = 8  # MEC-57: in-flight quote() cap (see _quotes_async)
-_QUOTES_BATCH = 20       # max symbols per quotes() call (ТЗ invariant (д))
+_QUOTES_BATCH = 20       # max symbols per quotes() call (spec invariant)
 
 
 # ------------------------------------------------------------------ helpers

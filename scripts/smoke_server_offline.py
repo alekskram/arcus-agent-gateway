@@ -2,7 +2,7 @@
 
 Monkeypatches api.assets/api.asset/api.prices/api.corporate_actions in
 the arcus_mcp.server namespace (server only ever calls api.<fn>(), by
-design) and exercises all 9 MCP tools of MEC-53 plus the ТЗ invariants:
+design) and exercises all 9 MCP tools of MEC-53 plus the spec invariants:
 
   * adjusted prices: bid_adjusted == round(bid_raw * multiplier, 6)
   * spread_raw >= 0

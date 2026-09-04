@@ -90,7 +90,7 @@ token_detail(symbol="SPLT")     # suspect token -> dossier with warnings
 ```
 
 **What to look at:** `warnings` — a pending multiplier change always surfaces
-there as `pending split: 1→X on DATE` (this is the ТЗ-mandated warning).
+there as `pending split: 1→X on DATE` (this is the spec-mandated warning).
 `multiplier.pending` is non-null only while a change is queued. After the
 split lands, `bid_raw` jumps ×4 while `bid_adjusted` stays comparable — cite
 both.
