@@ -1,10 +1,12 @@
-# Use cases: 5 agent scenarios
+# Use cases: 8 agent scenarios
 
 Each scenario: the user's question → the tool(s) to call → an example call →
 abbreviated output → what to look at. Output snippets are abbreviated JSON;
 single-quote values (scenario 1) are real fixture data from the live capture
-of 2026-09-03 — batch and sector examples are illustrative (only AAPL has a
-captured price fixture). Live numbers will differ.
+of 2026-09-03, and scenarios 6-8 (on-chain holder, wallet and transfer
+reads) are real captures from the live on-chain session of 2026-09-04 —
+batch and sector examples are illustrative (only AAPL has a captured price
+fixture). Live numbers will differ.
 
 ---
 
@@ -156,3 +158,126 @@ quotes(symbols=["NVDA", "TSLA"])
 just burns your upstream budget), ≤ 20 symbols per call, and the 15-second
 price cache means repeated calls inside one poll are free. Alert on
 `is_halted: true` or a `multiplier.pending` appearing mid-watch.
+
+---
+
+## 6. "How concentrated is AAPL ownership?" → `holder_snapshot("AAPL")`
+
+```python
+holder_snapshot(symbol="AAPL", limit=3)
+```
+
+```json
+{
+  "symbol": "AAPL",
+  "contract": "0xaF3D76f1834A1d425780943C99Ea8A608f8a93f9",
+  "count": 3,
+  "holders": [
+    {"address": "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+     "value": 6164.89213, "share_pct": 35.366316, "is_contract": true},
+    {"address": "0x498752D5fa0600CBd613074C151Abe15B3FeC7CB",
+     "value": 3185.821363, "share_pct": 18.276194, "is_contract": true},
+    {"address": "0xAae0d815EE56e4092a5E5C2911E676Fea50B2d6D",
+     "value": 915.887898, "share_pct": 5.254201, "is_contract": true}
+  ],
+  "total_supply": 17431.536275,
+  "total_supply_source": "rpc",
+  "next_page": true,
+  "note": "page capped at 50 rows by design (no pagination loops); more holders exist beyond this page"
+}
+```
+
+**What to look at:** the top 3 alone hold ~58.9% of supply
+(35.366316 + 18.276194 + 5.254201 = 58.896711) — `share_pct` is
+`value / total_supply * 100`, so it's directly comparable across tokens.
+`is_contract: true` on **every** top holder means this concentration sits
+in contracts (custody, treasury, AMM-style infrastructure), **not**
+individual whales — an EOA (`is_contract: false`) in the top ranks would be
+the actual "whale" signal. `total_supply` is source-tagged
+(`total_supply_source: "rpc"`, with explorer fallback): when supply is
+unavailable from both sources, every `share_pct` is `null` and a warning
+fires — the holder rows themselves are still fresh.
+
+---
+
+## 7. "What's in this wallet?" → `wallet_holdings(address)`
+
+Pick the address from a fresh transfer (the scenario 8 flow), then `quote()`
+the symbols **first** to warm the price cache — `est_position_usd` /
+`portfolio_usd_total` are computed **only** from quotes already cached in
+this process (cache-only, no fan-out):
+
+```python
+quote(symbol="AAPL")   # warm the cache first (15 s TTL)
+# -> {"bid_raw": 320.55, "ask_raw": 320.57, "mid_adjusted": 320.741463,
+#     "generated_at": "2026-09-04T19:56:09Z", ...}
+wallet_holdings(address="0xb8cdbcbc6f6f271906fcffd9235850b3b66cf653")
+```
+
+```json
+{
+  "address": "0xb8cdbcbc6f6f271906fcffd9235850b3b66cf653",
+  "count": 1,
+  "holdings": [
+    {"symbol": "AAPL", "name": "Apple • Robinhood Token",
+     "value": 13.968641, "est_position_usd": 4480.32}
+  ],
+  "portfolio_usd_total": 4480.32,
+  "priced_positions": 1
+}
+```
+
+**What to look at:** `est_position_usd` appears only for positions with a
+**fresh** cached quote (15 s TTL) — cold or stale quotes drop the estimate
+to `null` and a note tells you to `call quotes() on those symbols first`;
+that's why the `quote()` call precedes the holdings read. Positions are
+sorted by estimate descending, so the priciest position leads. `count` joins
+against **only** the 194-token universe — random ERC-20s the wallet holds
+are excluded, and a transit address that already forwarded everything shows
+the honest `count: 0`. With `quote("AAPL")` at `mid_adjusted` 320.741463,
+13.968641 tokens ≈ $4,480.32 — the estimate is `value × mid_adjusted`.
+
+---
+
+## 8. "Any whale movements in AAPL?" → `transfer_history("AAPL")`
+
+Agent alert recipe: poll `transfer_history` with a `min_value` threshold on
+an interval; every qualifying row is an alert candidate.
+
+```python
+transfer_history(symbol="AAPL", limit=10, min_value=10)
+```
+
+```json
+{
+  "transfers": [],
+  "note": "5 transfer(s) below min_value=10.0 filtered out; older transfers beyond the RPC window via explorer /tokens/{contract}/transfers",
+  "stopped_reason": null
+}
+```
+
+That honest empty result **is the story**: in the ~1 h public-RPC visibility
+window there was no ≥ 10 AAPL move. The same window captured unfiltered
+tells you what *was* moving:
+
+```json
+{"ts": "2026-09-04T19:53:42Z",
+ "from": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+ "to": "0xb8cdbcbc6f6f271906fcffd9235850b3b66cf653",
+ "value": 13.956813,
+ "tx_hash": "0x6a811ffafad11c3fd9735baafd76a3b162f3ff792f8fcbc15b551066435499c1",
+ "block": 54529214}
+```
+
+plus `0.065467` and `0.000614` hop-chained remints later in the window —
+the 13.956813 AAPL contract→wallet transfer is the whale candidate the
+scenario 7 wallet got its position from.
+
+**What to look at:** `min_value` filters in **token units** (`10` = 10 AAPL,
+not $10). The public RPC only serves a floating ~45-60-block window (~1 h
+of history); older transfers are reachable only via the explorer link the
+`note` points at. `stopped_reason: "window-closed"` (in `window`) means the
+walk-back hit the archive wall — partial data, not an error. And "empty
+`transfers` + a filtered-out `note`" is a healthy no-news answer, not a
+failure — the filter provably ran; nothing above threshold moved.
+

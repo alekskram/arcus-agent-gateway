@@ -1,23 +1,76 @@
 # Changelog
 
-<<<<<<< HEAD
-## 0.1.0 (2026-09-04)
+## 0.2.1 (2026-09-04)
 
-Initial release.
+Recorder wheel-packaging fix (v0.2.1): after
+`pip install arcus-agent-gateway[recorder]` the systemd unit's
+`python -m scripts.recorder --once` failed with
+`No module named scripts.recorder` — `[tool.hatch.build.targets.wheel]
+packages=["arcus_mcp"]` never ships `scripts/` (found on a live
+`/opt` install).
 
-- 9 read-only MCP tools for 194 tokenized US equities on Robinhood Chain
-  (Arcus DEX): `token_list`, `quote`, `quotes`, `token_detail`,
-  `market_status`, `corporate_actions`, `search`, `sector_view`,
-  `onchain_info` (v0.2 stub)
-- Multiplier handling: raw and adjusted price fields side by side,
-  pending-split warnings (effective time), per-token multiplier history note
-- Caching (300s / 15s / 3600s), client rate limit (50 req/s cap), 429 retry
-  with backoff
-- Honest degradation: unknown symbol errors point at `token_list()`;
-  `market_status()` labels its estimates; `onchain_info` is a marked stub
-- 75 offline tests including spec invariants (adjusted == raw x multiplier,
-  spread >= 0, halted propagation, batch limits)
-=======
+- **Recorder moved into the package**: `scripts/recorder.py` →
+  `arcus_mcp/recorder.py`; the wheel now ships it and the systemd
+  unit runs `python -m arcus_mcp.recorder --once`. Same behavior,
+  still standalone (reads only `arcus_mcp.api` + `arcus_mcp.paths`,
+  never `arcus_mcp.server`, so the recorder process stays fastmcp-free).
+- **`scripts/recorder.py` kept as a thin shim** for git-checkout
+  users: `python scripts/recorder.py --once` still works from a
+  checkout and delegates to the package module; exits nonzero with
+  the `[recorder]` install hint when `arcus_mcp` is not importable.
+- **examples/use-cases.md**: +3 on-chain scenarios (holder
+  concentration, wallet portfolio, whale movements) with real
+  captured data from the live session of 2026-09-04.
+- **tests/test_online.py**: opt-in online suite (7 live sanity checks:
+  quote, token_list, corporate_actions, holder_snapshot,
+  transfer_history, price_history degradation, market_status);
+  deselected by default via existing addopts, run with
+  `pytest tests/test_online.py -m online`; honest
+  skip-on-degradation, never a false fail. Not in CI by design.
+- Version bumped to 0.2.1 (pyproject + FastMCP + `arcus_mcp.__version__`,
+  which was stale at 0.1.0).
+
+## 0.2.0 (2026-09-04)
+
+On-chain layer: three new read-only tools reading the keyless public RPC
+and the Blockscout v2 explorer, with honest per-field degradation.
+
+- **onchain_info** (extended): keeps the v0.1 fields (contract, chain id,
+  network, decimals, ISIN) and adds `total_supply` via `totalSupply()`
+  eth_call (source `rpc`), `holders_count` + `circulating_market_cap`
+  (source `explorer`), and a `supply_crosscheck` of the REST-implied
+  capitalization (`total_supply × multiplier × mid`) vs the explorer's —
+  a >1% divergence lands in `warnings[]`. Every derived field carries a
+  per-field `source` tag; each of the three sources fails independently
+  to a warning, never silently.
+- **holder_snapshot** (`symbol, limit=20`): top holders from the
+  explorer (one page, max 50 rows, 600 s cache) with rows `address`,
+  `value` (raw/1e18), `share_pct` = value / total_supply × 100,
+  `is_contract`; total_supply from the RPC with an explorer fallback
+  (source-tagged), `share_pct: null` + warning when no supply is
+  available at all.
+- **wallet_holdings** (`address`): explorer `token-balances` intersected
+  with the 194-token `assets()` universe; `est_position_usd` and
+  `portfolio_usd_total` computed ONLY from quotes already in the price
+  cache (no quote fan-out), with an explanatory note when quotes are
+  missing or stale. Cached 120 s.
+- **transfer_history** (`symbol, limit=25, min_value=None`): recent
+  ERC-20 Transfer events via the public RPC's adaptive walk-back
+  (windows start 48 blocks wide, shrink 48→32→16→8 on archive-403s,
+  ≤14 getLogs requests). Rows: `ts` (ISO from the log's own
+  `blockTimestamp`), `from`, `to`, `value` (raw/1e18), `tx_hash`,
+  `block`; `min_value` filters in token units; a window exhausted with
+  0 logs produces an explicit note pointing at the explorer's transfer
+  list. Cached 60 s.
+- **New stdlib clients**: `arcus_mcp/rpc.py` (JSON-RPC with 429/5xx
+  retry + backoff, drpc fallback for chainId/blockNumber, RpcError
+  taxonomy `rpc-timeout|rpc-http|rpc-network|rpc-limit`) and
+  `arcus_mcp/explorer.py` (Blockscout v2 with the mandatory browser
+  User-Agent — plain clients get a Cloudflare 403 challenge —
+  ExplorerError taxonomy `cloudflare|explorer-timeout|explorer-http|
+  explorer-network`).
+- Version bumped to 0.2.0 (FastMCP + pyproject).
+
 ## 0.1.1 (2026-09-04)
 
 - **price_history tool** (`symbol`, `timeframe="daily"|"raw"`, `limit=90`):
@@ -51,4 +104,3 @@ Initial release.
   token_detail, market_status, corporate_actions, search, sector_view,
   onchain_info), stdlib REST client with caching/rate-limit/retries,
   validated 13-sector map, 75 offline tests, live-smoked (19/19, 49/49).
->>>>>>> mec-v011

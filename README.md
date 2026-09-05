@@ -75,7 +75,7 @@ curl http://127.0.0.1:8902/health            # -> {"ok": true, "service": "arcus
 
 ## Tools
 
-All 9 tools are read-only (annotated `readOnlyHint: true`). Names and
+All 13 tools are read-only (annotated `readOnlyHint: true`). Names and
 parameters are exactly as registered by `arcus_mcp/server.py`.
 
 | # | Tool | Signature | What it does |
@@ -88,8 +88,11 @@ parameters are exactly as registered by `arcus_mcp/server.py`.
 | 6 | `corporate_actions` | `corporate_actions(symbol=None, limit=10)` | Splits/dividends across all tokens or for one symbol; tolerant to the API's field-name variants. |
 | 7 | `search` | `search(query, limit=10)` | Local fuzzy search over the token list; `apple` → `AAPL`; top `limit` (cap 50) with scores and sectors. |
 | 8 | `sector_view` | `sector_view(warm=False, sector=None)` | 13-sector static map with sizes and multiplier-adjusted sector averages. Default (`warm=False`): caches only, zero requests, `warmed: false`. `warm=True, sector="..."`: fans out fresh quotes for that sector only and reports `requests_made`. |
-| 9 | `onchain_info` | `onchain_info(symbol)` | Contract address, chain id (4663, Robinhood Chain), network, decimals, ISIN. v0.2 stub — full on-chain data (balances, Transfer/Split history) is planned for v0.2. |
+| 9 | `onchain_info` | `onchain_info(symbol)` | On-chain footprint joined from three independent sources (each fails to a `warnings[]` entry, never silently): contract address, chain id (4663, Robinhood Chain), network, decimals, ISIN (REST) + `total_supply` via `totalSupply()` eth_call (source `rpc`) + `holders_count`, `circulating_market_cap` (source `explorer`). `supply_crosscheck` compares the REST-implied cap (`total_supply × multiplier × mid`) with the explorer's; >1% divergence → warning. Per-field `source` tags on every derived value. |
 | 10 | `price_history` | `price_history(symbol, timeframe="daily", limit=90)` | OHLCV history from the optional recorder's local parquet store (see below). Honest degradation: missing pyarrow or data → actionable `error` dict, never a silent empty list. |
+| 11 | `holder_snapshot` | `holder_snapshot(symbol, limit=20)` | Top holders of a token's contract from the Blockscout explorer (one page, max 50 rows, 600 s cache). Rows: `address`, `value` (float token units), `share_pct` = value / total_supply × 100, `is_contract`. `total_supply` from the RPC with an explorer fallback (source-tagged); no supply at all → `share_pct: null` + warning. Errors → `error` dict with `kind` + `hint`. |
+| 12 | `wallet_holdings` | `wallet_holdings(address)` | Which of the 194 tokenized equities a wallet holds (explorer `token-balances` ∩ `assets()` universe). Rows: `symbol`, `name`, `value` (float token units). `est_position_usd` / `portfolio_usd_total` computed ONLY from quotes already in the price cache (no fan-out); missing/stale quotes → `null` estimates + explanatory note. Cached 120 s. |
+| 13 | `transfer_history` | `transfer_history(symbol, limit=25, min_value=None)` | Recent ERC-20 `Transfer` events from the public RPC's adaptive walk-back (windows start 48 blocks wide, shrink 48→32→16→8 on archive 403s, ≤14 getLogs requests — see [On-chain sources & limits](#on-chain-sources--limits)). Rows (newest first): `ts` (ISO, from the log's own `blockTimestamp`), `from`, `to`, `value` (float), `tx_hash`, `block`. `min_value` filters in token units; window exhausted with 0 logs → explicit note pointing at the explorer. Cached 60 s. |
 | — | *watchlist* | — | Not a tool. Price tracking is done by your agent's scheduler (cron) calling `quotes()` on an interval — see [`.agents/skills/arcus-gateway/SKILL.md`](.agents/skills/arcus-gateway/SKILL.md). |
 
 ## Multiplier logic (read this before using prices)
@@ -136,6 +139,38 @@ always read adjusted values next to the multiplier.
   are computed from caches and assets only — they never fan out 194 price
   requests.
 
+## On-chain sources & limits
+
+The v0.2 on-chain tools read **two keyless public sources** next to the REST
+API. Both are free, rate-limited and partially restricted — every tool above
+degrades honestly (per-field omission + `warnings[]` / `error` dicts), never
+with a silent empty answer.
+
+- **Public JSON-RPC** (default `robinhood-rpc.publicnode.com`, override with
+  `ARCUS_RPC_URL`): `eth_call` (e.g. `totalSupply()`) works normally.
+  **`eth_getLogs` only answers inside a floating ~45–60-block window behind
+  the latest block** — wider or older ranges get HTTP 403 "Archive requests
+  require a personal token" (the backend is Alchemy). The window drifts
+  minute to minute, so `transfer_history()` walks back in windows that start
+  48 blocks wide and shrink 48→32→16→8 on each 403, capped at ~14 getLogs
+  requests. `eth_getLogs` log objects carry `blockTimestamp` directly — no
+  per-block lookups are needed.
+- **Fallback RPC** (`robinhood.drpc.org`, `ARCUS_RPC_FALLBACK_URL`): has
+  **no `eth_getLogs` and no `eth_call`** (JSON-RPC "method not available");
+  it is used only for `eth_chainId` / `eth_blockNumber`.
+- **Blockscout v2 explorer** (`robinhoodchain.blockscout.com/api/v2`,
+  `ARCUS_EXPLORER_URL`): **requires a browser User-Agent on every request**
+  — plain HTTP clients get a Cloudflare 403 "Just a moment…" HTML challenge.
+  Token pages (`holders_count`, `circulating_market_cap`, `total_supply`),
+  one holders page (max 50 rows, no pagination loops) and address
+  `token-balances` come from here, cached 600 s. `token-balances` answers in
+  ~0.5 s on plain wallets but **hangs 40 s+ on huge contract addresses** —
+  the client fails honestly after 15 s with kind `explorer-timeout`.
+- **On-chain activity ≠ trades.** The chain records `Transfer`, mint and
+  redeem events between addresses; it knows nothing about order-book trades
+  or prices. Use `quote()`/`quotes()` for prices and `transfer_history()`
+  for token movement.
+
 ## Raw prices disclaimer
 
 Prices are served **exactly as they arrive from Robinhood (RAW)** — they are
@@ -168,9 +203,11 @@ pip install "arcus-agent-gateway[recorder]"   # adds pyarrow (optional extra)
 sudo cp deploy/arcus-recorder.* /etc/systemd/system/
 sudo systemctl enable --now arcus-recorder.timer   # OnCalendar=*:0/5, Persistent
 # or run one tick / a debug loop manually:
-python scripts/recorder.py --once
-python scripts/recorder.py --limit 5            # debug: first 5 symbols only
-ARCUS_INTERVAL_SEC=60 python scripts/recorder.py  # custom interval loop
+python -m arcus_mcp.recorder --once
+python -m arcus_mcp.recorder --limit 5            # debug: first 5 symbols only
+ARCUS_INTERVAL_SEC=60 python -m arcus_mcp.recorder  # custom interval loop
+# (from a git checkout, `python scripts/recorder.py ...` still works -
+#  it is a thin shim that delegates to arcus_mcp.recorder)
 ```
 
 **Data weight & rotation.** Full universe (194 symbols) at a 5-minute tick ≈
@@ -195,7 +232,10 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 ```
 
 Layout: `arcus_mcp/api.py` (stdlib REST client), `arcus_mcp/server.py` (the MCP
-tools + FastMCP wiring), `arcus_mcp/sectors.py` (validated 13-sector map),
-`arcus_mcp/paths.py` (state dir; override with `ARCUS_GATEWAY_DATA`).
+tools + FastMCP wiring), `arcus_mcp/rpc.py` (public JSON-RPC client with the
+adaptive Transfer-log walk-back), `arcus_mcp/explorer.py` (Blockscout v2
+client with the mandatory browser User-Agent), `arcus_mcp/sectors.py`
+(validated 13-sector map), `arcus_mcp/paths.py` (state dir; override with
+`ARCUS_GATEWAY_DATA`).
 Live-captured schema fixtures live in `tests/fixtures/` with notes in
 `arcus_mcp/API_NOTES.md`. Usage scenarios: [`examples/use-cases.md`](examples/use-cases.md).

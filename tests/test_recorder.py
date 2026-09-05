@@ -1,32 +1,31 @@
-"""v0.1.1: recorder tests - 100% offline (api monkeypatched, tmp data dir).
+"""v0.2.1: recorder tests - 100% offline (api monkeypatched, tmp data dir).
 
 Covers:
   [T1] write_snapshot append + dedupe on (ts_utc, symbol)
   [T2] roll_daily OHLC + volume=MAX (not sum) + idempotent re-run
   [T3] missing pyarrow -> SystemExit with the [recorder] extra hint
   [T4] universe() filters ACTIVE + market-tradable only
+  [T5] wheel packaging regression: arcus_mcp/recorder.py ships inside
+       the wheel and scripts/ does not; scripts/recorder.py is a shim
+       that delegates to the package module
 
 No socket may open: arcus_mcp.api.assets/prices are monkeypatched, and
 tests/conftest.py has already pointed ARCUS_GATEWAY_DATA at a tmp dir.
 
-scripts/ is not a package, so the module is loaded by path
-(spec_from_file_location).
+Since 0.2.1 the recorder lives in the package (regression: scripts/ was
+never packaged, so pip installs died on `python -m scripts.recorder`)
+and is imported directly.
 """
-import importlib.util
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-REPO = Path(__file__).resolve().parent.parent
-_spec = importlib.util.spec_from_file_location(
-    "recorder", REPO / "scripts" / "recorder.py")
-assert _spec is not None and _spec.loader is not None
-recorder = importlib.util.module_from_spec(_spec)
-sys.modules["recorder"] = recorder  # so helpers resolve if re-imported
-_spec.loader.exec_module(recorder)
+from arcus_mcp import api, recorder
 
-from arcus_mcp import api  # noqa: E402
+REPO = Path(__file__).resolve().parent.parent
 
 
 @pytest.fixture(autouse=True)
@@ -247,3 +246,69 @@ def test_mid_adjusted_uses_multiplier(monkeypatch):
                              2.0)["mid_adjusted"] is None
     assert recorder.snap_row("t", "X", _quote(), None)["mid_adjusted"] is None
     assert recorder.snap_row("t", "X", None, 1.0) is None
+
+
+# --------------------------------------- [T5] wheel-packaging regression
+
+
+def test_t5_wheel_ships_recorder_module(tmp_path):
+    """Recorder wheel-packaging regression: build the real wheel with hatchling (offline,
+    no pip/network) and assert the recorder is IN it. The bug was that
+    scripts/ was never packaged, so `python -m scripts.recorder` died
+    on pip installs; the fix ships arcus_mcp/recorder.py instead."""
+    import zipfile
+
+    from hatchling.builders.wheel import WheelBuilder
+
+    wb = WheelBuilder(str(REPO))
+    whl = next(iter(wb.build(directory=str(tmp_path))))
+    names = zipfile.ZipFile(whl).namelist()
+    assert whl.endswith(".whl")
+    assert "arcus_mcp/recorder.py" in names
+    # the old location is gone from the wheel (shim lives in the repo,
+    # not in the distribution) and no scripts/ ever ships
+    assert not [n for n in names if n.startswith("scripts/")]
+
+
+def test_t5_recorder_module_importable_without_fastmcp():
+    """`import arcus_mcp.recorder` works in a fresh interpreter and the
+    recorder process never pulls in arcus_mcp.server / fastmcp. Run in
+    a subprocess (this suite's test_server imports fastmcp into the
+    pytest interpreter, which would pollute sys.modules) with the
+    worktree on PYTHONPATH first: the dev venv's editable install
+    points at the ORIGINAL checkout, which does not have the module."""
+    code = ("import arcus_mcp.recorder as r, sys; "
+            "assert callable(r.main) and callable(r.tick); "
+            "assert 'arcus_mcp.server' not in sys.modules, 'server loaded'; "
+            "assert 'fastmcp' not in sys.modules, 'fastmcp loaded'; "
+            "print('recorder-import-ok')")
+    env = {**os.environ, "PYTHONPATH": str(REPO)}
+    p = subprocess.run([sys.executable, "-c", code],
+                       capture_output=True, text=True, env=env, timeout=60)
+    assert p.returncode == 0, p.stderr
+    assert "recorder-import-ok" in p.stdout
+
+
+def test_t5_shim_delegates_to_package_module(tmp_path):
+    """`python scripts/recorder.py --help` works from a checkout (the
+    shim delegates to arcus_mcp.recorder) and never touches the API."""
+    env = {k: v for k, v in os.environ.items()
+           if k != "PYTHONPATH"}  # checkout case: repo root only via the shim
+    env["ARCUS_GATEWAY_DATA"] = str(tmp_path)
+    p = subprocess.run(
+        [sys.executable, str(REPO / "scripts" / "recorder.py"), "--help"],
+        capture_output=True, text=True, cwd=str(REPO), env=env, timeout=60)
+    assert p.returncode == 0
+    assert "arcus-recorder" in p.stdout  # argparse prog from the real module
+
+    # the not-importable case: the shim ALONE (copied out of the repo,
+    # no adjacent arcus_mcp/) run with -S so the dev venv's editable
+    # .pth cannot supply the package either -> nonzero + [recorder] hint
+    alone = tmp_path / "recorder.py"
+    alone.write_text((REPO / "scripts" / "recorder.py").read_text(),
+                     encoding="utf-8")
+    p2 = subprocess.run([sys.executable, "-S", str(alone), "--help"],
+                        capture_output=True, text=True, cwd=str(tmp_path),
+                        timeout=60)
+    assert p2.returncode != 0
+    assert "arcus-agent-gateway[recorder]" in (p2.stderr + p2.stdout)
