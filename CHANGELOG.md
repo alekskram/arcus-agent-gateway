@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.2.1 (2026-09-04)
+
+Recorder wheel-packaging fix (v0.2.1): after
+`pip install arcus-agent-gateway[recorder]` the systemd unit's
+`python -m scripts.recorder --once` failed with
+`No module named scripts.recorder` — `[tool.hatch.build.targets.wheel]
+packages=["arcus_mcp"]` never ships `scripts/` (found on a live
+`/opt` install).
+
+- **Recorder moved into the package**: `scripts/recorder.py` →
+  `arcus_mcp/recorder.py`; the wheel now ships it and the systemd
+  unit runs `python -m arcus_mcp.recorder --once`. Same behavior,
+  still standalone (reads only `arcus_mcp.api` + `arcus_mcp.paths`,
+  never `arcus_mcp.server`, so the recorder process stays fastmcp-free).
+- **`scripts/recorder.py` kept as a thin shim** for git-checkout
+  users: `python scripts/recorder.py --once` still works from a
+  checkout and delegates to the package module; exits nonzero with
+  the `[recorder]` install hint when `arcus_mcp` is not importable.
+- **examples/use-cases.md**: +3 on-chain scenarios (holder
+  concentration, wallet portfolio, whale movements) with real
+  captured data from the live session of 2026-09-04.
+- **tests/test_online.py**: opt-in online suite (7 live sanity checks:
+  quote, token_list, corporate_actions, holder_snapshot,
+  transfer_history, price_history degradation, market_status);
+  deselected by default via existing addopts, run with
+  `pytest tests/test_online.py -m online`; honest
+  skip-on-degradation, never a false fail. Not in CI by design.
+- Version bumped to 0.2.1 (pyproject + FastMCP + `arcus_mcp.__version__`,
+  which was stale at 0.1.0).
+
 ## 0.2.0 (2026-09-04)
 
 On-chain layer: three new read-only tools reading the keyless public RPC

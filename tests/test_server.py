@@ -710,7 +710,7 @@ def test_price_history_no_data_degrades_daily_and_raw(monkeypatch,
     raw = srv.price_history("AAPL", timeframe="raw")
     assert "recorder not enabled" in raw["error"]
     assert raw["note"] == ("no snapshot files found; run the recorder "
-                           "(scripts/recorder.py) to start collecting")
+                           "(python -m arcus_mcp.recorder) to start collecting")
     assert raw["timeframe"] == "raw" and raw["count"] == 0
 
 
