@@ -2,21 +2,38 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.alekskram/arcus-agent-gateway",
   "title": "Arcus Agent Gateway",
-  "description": "Read-only MCP gateway to 194 tokenized US equities on Robinhood Chain (Arcus): quotes, corporate actions, holders, whale transfers. No keys.",
+  "description": "Read-only MCP gateway to 194 tokenized US equities on Robinhood Chain: quotes, holders, whales.",
   "version": "0.2.2",
   "tools": [
-    {"name": "token_list", "description": "Tokenized equities with symbol, multiplier and tradability"},
-    {"name": "quote", "description": "Live quote with raw and multiplier-adjusted prices side by side"},
-    {"name": "holder_snapshot", "description": "Top holders of a token contract with share percentages"},
-    {"name": "transfer_history", "description": "Recent ERC-20 transfers with min-value whale filter"},
-    {"name": "wallet_holdings", "description": "Which tokenized equities a wallet holds, with USD estimates"}
+    {
+      "name": "token_list",
+      "description": "Tokenized equities with symbol, multiplier and tradability"
+    },
+    {
+      "name": "quote",
+      "description": "Live quote with raw and multiplier-adjusted prices side by side"
+    },
+    {
+      "name": "holder_snapshot",
+      "description": "Top holders of a token contract with share percentages"
+    },
+    {
+      "name": "transfer_history",
+      "description": "Recent ERC-20 transfers with min-value whale filter"
+    },
+    {
+      "name": "wallet_holdings",
+      "description": "Which tokenized equities a wallet holds, with USD estimates"
+    }
   ],
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "arcus-agent-gateway",
       "version": "0.2.2",
-      "transport": {"type": "stdio"}
+      "transport": {
+        "type": "stdio"
+      }
     }
   ],
   "repository": {
