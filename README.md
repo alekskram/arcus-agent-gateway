@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/alekskram/arcus-agent-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/alekskram/arcus-agent-gateway/actions/workflows/tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/arcus-agent-gateway.svg)](https://pypi.org/project/arcus-agent-gateway/)
+[![PyPI downloads](https://img.shields.io/pypi/dm/arcus-agent-gateway?label=downloads)](https://pypi.org/project/arcus-agent-gateway/)
+[![MCP Catalog](https://img.shields.io/badge/MCP_Catalog-glama.ai-4f46e5)](https://glama.ai/mcp/servers/alekskram/arcus-agent-gateway)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
 
@@ -23,6 +25,11 @@ enthusiastic agent can't hammer the upstream.
 Full walkthroughs with real outputs: [examples/use-cases.md](examples/use-cases.md).
 
 ## Quickstart
+
+**Claude Code:**
+```bash
+claude mcp add arcus -- uvx arcus-agent-gateway
+```
 
 Run over stdio (the default, for local agents):
 
@@ -141,6 +148,18 @@ block exposes `pending` + `effective_time`. After the split lands, raw prices
 jump by the ratio while `*_adjusted` fields stay comparable — another reason to
 always read adjusted values next to the multiplier.
 
+## Why a gateway and not the raw API?
+
+`api.robinhood.com/rhj` + the public RPC are open — and every agent hitting them directly rediscovers the same traps:
+
+| Raw sources give you | You would have to build |
+|---|---|
+| RAW, non-multiplier-adjusted prices (`bid`/`ask` in contract units) | the multiplier math, raw/adjusted pairs on every quote, pending-split detection with effective times |
+| no price history endpoint at all | a recorder (opt-in here): 5-min snapshots → parquet → idempotent daily OHLCV rollup |
+| 60 req/s upstream limit | a polite rate-limited client (≤50 req/s), per-endpoint caches, parallel batched quotes |
+| RPC archive window that 403s outside ~45–60 blocks behind head | adaptive walk-back (48→32→16→8 block windows, ≤14 getLogs) |
+| a Blockscout explorer behind a Cloudflare UA check, 40 s hangs on contract wallets | browser UA, timeouts, honest `error`/`warnings[]` degradation — never a silent empty list |
+
 ## API limits & caching
 
 - Upstream allows **60 req/s without a key**; this client self-limits to
@@ -245,6 +264,19 @@ silent empty answer.
 - **No telemetry, no logging of your prompts.** The server caches public
   market data in memory (and parquet files only if you enable the optional
   recorder); nothing leaves your machine except the API reads themselves.
+
+## Part of the suite
+
+Four sibling read-only MCP gateways, one style — keyless, cached, honest degradation:
+
+| Gateway | Focus |
+|---|---|
+| [dydx-agent-gateway](https://github.com/alekskram/dydx-agent-gateway) | dYdX v4: verified trader PnL, funding/OI anomaly detectors, leaderboard |
+| **arcus-agent-gateway** (you are here) | 194 tokenized US equities on Robinhood Chain: quotes, holders, whale transfers |
+| [hyperliquid-agent-gateway](https://github.com/alekskram/hyperliquid-agent-gateway) | Hyperliquid: 233 perps + spot, funding carry, account risk, HyperEVM |
+| [aster-agent-gateway](https://github.com/alekskram/aster-agent-gateway) | Aster DEX: ~580 futures incl. 24/7 TradFi perps, funding caps/floors |
+
+All four are on [glama.ai](https://glama.ai/mcp/servers/alekskram/arcus-agent-gateway) and PyPI — install any of them with `uvx <name>`.
 
 ## License
 
