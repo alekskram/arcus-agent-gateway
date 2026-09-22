@@ -1,5 +1,7 @@
 # arcus-agent-gateway
 
+<!-- mcp-name: io.github.alekskram/arcus-agent-gateway -->
+
 [![CI](https://github.com/alekskram/arcus-agent-gateway/actions/workflows/tests.yml/badge.svg)](https://github.com/alekskram/arcus-agent-gateway/actions/workflows/tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/arcus-agent-gateway.svg)](https://pypi.org/project/arcus-agent-gateway/)
 [![PyPI downloads](https://img.shields.io/pypi/dm/arcus-agent-gateway?label=downloads)](https://pypi.org/project/arcus-agent-gateway/)

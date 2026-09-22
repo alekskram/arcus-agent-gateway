@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.2 (2026-09-09) — promotion pass
+
+README install funnel: claude mcp add one-liner, downloads/glama badges, raw-API comparison table, suite cross-links; server.json added (official MCP Registry metadata); mcp-name comment.
+
+
 ## 0.2.1 (2026-09-04)
 
 Recorder wheel-packaging fix (v0.2.1): after
