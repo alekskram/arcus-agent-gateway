@@ -3,7 +3,7 @@
   "name": "io.github.alekskram/arcus-agent-gateway",
   "title": "Arcus Agent Gateway",
   "description": "Read-only MCP gateway to 194 tokenized US equities on Robinhood Chain: quotes, holders, whales.",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "tools": [
     {
       "name": "token_list",
@@ -30,7 +30,7 @@
     {
       "registryType": "pypi",
       "identifier": "arcus-agent-gateway",
-      "version": "0.2.3",
+      "version": "0.2.4",
       "transport": {
         "type": "stdio"
       }

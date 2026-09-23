@@ -193,8 +193,15 @@ with a silent empty answer.
   **no `eth_getLogs` and no `eth_call`** (JSON-RPC "method not available");
   it is used only for `eth_chainId` / `eth_blockNumber`.
 - **Blockscout v2 explorer** (`robinhoodchain.blockscout.com/api/v2`,
-  `ARCUS_EXPLORER_URL`): **requires a browser User-Agent on every request**
-  — plain HTTP clients get a Cloudflare 403 "Just a moment…" HTML challenge.
+  `ARCUS_EXPLORER_URL`): requires a browser User-Agent on every request,
+  and since Sep 2026 also passes Cloudflare's **TLS-fingerprint** bot
+  management — a plain client gets 403 even with browser headers. The
+  gateway retries every Cloudflare 403 once with curl_cffi Chrome
+  impersonation when the optional extra is installed:
+  `pip install "arcus-agent-gateway[browser]"`. Without it, the two
+  explorer-backed tools (`holder_snapshot`, `wallet_holdings`) return an
+  honest `cloudflare` error with this exact hint; everything else keeps
+  working.
   Token pages (`holders_count`, `circulating_market_cap`, `total_supply`),
   one holders page (max 50 rows, no pagination loops) and address
   `token-balances` come from here, cached 600 s. `token-balances` answers in

@@ -85,11 +85,54 @@ def _is_timeout(e: BaseException) -> bool:
     return "timed out" in str(e).lower() or "timed out" in str(reason or "")
 
 
+def _cf_error(url: str, code: int, body_hint: str) -> ExplorerError:
+    """Cloudflare-blocked error with the [browser]-extra hint."""
+    return ExplorerError(
+        "cloudflare",
+        f"explorer Cloudflare challenge for {url} (HTTP {code})",
+        status=code,
+        hint=body_hint)
+
+
+def _browser_fetch(url: str) -> bytes | None:
+    """curl_cffi (Chrome TLS impersonation) fallback for Cloudflare 403s.
+
+    Cloudflare fingerprints TLS handshakes, so a browser User-Agent alone
+    does not pass once bot management is enabled. curl_cffi replays a real
+    Chrome ClientHello. Returns response bytes, or None on 404.
+    Raises ExplorerError when curl_cffi is not installed (hint: the
+    [browser] extra) or the retry is also blocked."""
+    try:
+        from curl_cffi import requests as _cffi_requests
+    except ImportError:
+        raise _cf_error(
+            url, 403,
+            "Cloudflare blocked the plain client and curl_cffi is not "
+            "installed - run: pip install 'arcus-agent-gateway[browser]'")
+    try:
+        r = _cffi_requests.get(url, impersonate="chrome", timeout=_TIMEOUT)
+    except Exception as e:  # network/timeout inside curl_cffi
+        raise ExplorerError(
+            "explorer-network",
+            f"explorer unreachable via curl_cffi: {url} ({e})",
+            hint="browser-impersonation fallback failed at network level")
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise _cf_error(
+            url, r.status_code,
+            "Cloudflare blocked even the browser-impersonated request - "
+            "the IP may be banned; try another network")
+    return r.content
+
+
 def _get(path: str, params: dict | None = None) -> dict | list | None:
     """GET {_base()}{path}[?params] with the browser UA on every request.
 
     Retries (2x, backoff 2s*(n+1)) on 5xx and network errors only;
-    timeouts and Cloudflare challenges fail immediately and honestly.
+    timeouts fail immediately and honestly. A Cloudflare 403 (TLS
+    fingerprinting) is retried once through curl_cffi Chrome
+    impersonation when the optional [browser] extra is installed.
     Raises ExplorerError; returns parsed JSON (None for 404).
     """
     qs = ""
@@ -107,13 +150,12 @@ def _get(path: str, params: dict | None = None) -> dict | list | None:
                 body = e.read()
             except Exception:
                 body = b""
-            if b"Just a moment" in body:  # Cloudflare challenge page
-                raise ExplorerError(
-                    "cloudflare",
-                    f"explorer Cloudflare challenge for {url} (HTTP {e.code})",
-                    status=e.code,
-                    hint="Cloudflare blocked the request - browser "
-                         "User-Agent required") from e
+            if e.code == 403 or b"Just a moment" in body:
+                # Cloudflare challenge page: try the impersonation fallback.
+                raw = _browser_fetch(url)
+                if raw is None:
+                    return None
+                return json.loads(raw)
             if 500 <= e.code <= 599 and attempt < _RETRIES - 1:
                 time.sleep(2.0 * (attempt + 1))
                 continue

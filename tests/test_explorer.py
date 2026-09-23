@@ -263,25 +263,39 @@ def test_cloudflare_403_maps_to_cloudflare_kind(explorer_mock, monkeypatch):
     def fake_open(req, timeout=None):
         raise _cloudflare_403(req.full_url)
 
+    def browser_also_blocked(url):
+        raise explorer._cf_error(
+            url, 403,
+            "Cloudflare blocked even the browser-impersonated request - "
+            "the IP may be banned; try another network")
+
     monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr(explorer, "_browser_fetch", browser_also_blocked)
     with pytest.raises(explorer.ExplorerError) as ei:
         explorer.token(CONTRACT)
     assert ei.value.kind == "cloudflare"
     assert ei.value.status == 403
-    assert "User-Agent" in (ei.value.hint or "")
+    assert "IP may be banned" in (ei.value.hint or "")
 
 
 def test_cloudflare_not_retried(explorer_mock, monkeypatch):
     hits = {"n": 0}
+    browser_hits = {"n": 0}
 
     def fake_open(req, timeout=None):
         hits["n"] += 1
         raise _cloudflare_403(req.full_url)
 
+    def browser_blocked(url):
+        browser_hits["n"] += 1
+        raise explorer._cf_error(url, 403, "blocked even impersonated")
+
     monkeypatch.setattr(urllib.request, "urlopen", fake_open)
+    monkeypatch.setattr(explorer, "_browser_fetch", browser_blocked)
     with pytest.raises(explorer.ExplorerError):
         explorer.token(CONTRACT)
-    assert hits["n"] == 1  # challenge fails fast: no backoff burn
+    assert hits["n"] == 1          # challenge: one plain attempt
+    assert browser_hits["n"] == 1  # one impersonated retry, then fail fast
     assert explorer_mock.sleeps == []
 
 
@@ -388,3 +402,72 @@ def test_requests_use_items_count_fifty(explorer_mock):
     explorer.token_holders(CONTRACT)
     url = explorer_mock.calls[-1]["url"]
     assert "items_count=50" in url  # always the max page size
+
+
+# --- Cloudflare 403 -> curl_cimpersonation fallback (v0.2.4) ---------------
+
+class FakeHTTPError403(urllib.error.HTTPError):
+    def __init__(self, url):
+        super().__init__(url, 403, "Forbidden",
+                         hdrs=None, fp=io.BytesIO(b"Just a moment..."))
+        self.url = url
+
+    def read(self, *a):  # HTTPError.read needs a working fp
+        return b"Just a moment..."
+
+
+@pytest.fixture
+def cf_mock(monkeypatch):
+    """urlopen always 403-challenges; _browser_fetch is recorded+stubbed."""
+    fresh = monkeypatch
+    fresh.setattr(explorer, "_TOKEN_CACHE", {})  # defeat caches
+    fresh.setattr(explorer, "_HOLDERS_CACHE", {})
+    fresh.setattr(explorer, "_BALANCES_CACHE", {})
+    browser_calls: list[str] = []
+
+    def fake_urlopen(req, timeout=None):
+        raise FakeHTTPError403(req.full_url)
+
+    def fake_browser_fetch(url):
+        browser_calls.append(url)
+        return (FIXTURES / "explorer_holders.json").read_bytes()
+
+    fresh.setattr(urllib.request, "urlopen", fake_urlopen)
+    fresh.setattr(explorer, "_browser_fetch", fake_browser_fetch)
+    return browser_calls
+
+
+def test_cf_403_falls_back_to_browser_fetch(cf_mock):
+    out = explorer.token_holders(CONTRACT)
+    assert isinstance(out, dict) and "items" in out
+    assert len(cf_mock) == 1  # exactly one impersonated retry
+
+
+def test_cf_404_via_browser_returns_none(cf_mock, monkeypatch):
+    monkeypatch.setattr(explorer, "_browser_fetch", lambda url: None)
+    assert explorer.token(CONTRACT) is None
+
+
+def test_cf_without_cffi_gives_install_hint(monkeypatch):
+    err = explorer._cf_error("https://x", 403,
+                             "Cloudflare blocked the plain client and "
+                             "curl_cffi is not installed - run: pip install "
+                             "'arcus-agent-gateway[browser]'")
+    d = err.to_dict()["error"]
+    assert d["kind"] == "cloudflare"
+    assert "arcus-agent-gateway[browser]" in d["hint"]
+
+
+def test_browser_fetch_importerror_hint(monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def no_cffi(name, *a, **k):
+        if name.startswith("curl_cffi"):
+            raise ImportError("no curl_cffi")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_cffi)
+    with pytest.raises(explorer.ExplorerError) as ei:
+        explorer._browser_fetch("https://x")
+    assert "[browser]" in ei.value.hint

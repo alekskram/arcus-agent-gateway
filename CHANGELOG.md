@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.4 (2026-09-23) — Cloudflare fix
+
+Blockscout moved to TLS-fingerprint bot management: browser headers alone
+now get 403. Every Cloudflare 403 is retried once with curl_cffi Chrome
+impersonation when `arcus-agent-gateway[browser]` is installed (new
+optional extra); without it the explorer tools return an honest error
+with the install hint. holder_snapshot and wallet_holdings verified
+live end-to-end after the fix.
+
+
 ## 0.2.3 (2026-09-22) — audit pass
 
 Server version string drift fixed (reported 0.2.1 to MCP clients).
