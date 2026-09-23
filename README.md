@@ -9,20 +9,15 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](pyproject.toml)
 
-An MCP (Model Context Protocol) server that gives AI agents read-only, keyless
-access to market data for the **194 tokenized US equities** on **Robinhood Chain
-(Arcus)** — quotes, corporate actions, trading capabilities, multipliers and a
-13-sector map. No API keys, no auth, no writes: every tool is a GET against the
-public `api.robinhood.com/rhj` REST surface, cached and rate-limited so an
-enthusiastic agent can't hammer the upstream.
+Robinhood Chain (Arcus) carries 194 tokenized US equities on-chain, and its public API answers questions most people don't think to ask: who actually holds AAPL, what a wallet's stock portfolio looks like, which way the whales moved NVDA today. This MCP server hands all of that to an AI agent. Read-only, keyless, no writes; every tool is a GET against `api.robinhood.com/rhj` plus two public on-chain sources, cached and rate-limited so an enthusiastic agent can't hammer the upstream.
 
 ## Use cases
 
-- **"Who actually holds AAPL?"** — top holders with on-chain share %, contract vs EOA, concentration risk ([holder_snapshot scenario](examples/use-cases.md))
-- **Watch any wallet** — full portfolio across all 194 tokenized equities, valued at cached quotes (`wallet_holdings`)
-- **Catch whale moves** — live ERC-20 Transfer feed with a `min_value` filter for large-print alerts (`transfer_history`)
-- **Split-safe prices** — raw vs multiplier-adjusted quotes side by side, pending-split warnings with effective time (`quote`, `token_detail`)
-- **Morning scan** — market-wide health, halted tokens and 13-sector averages in two cheap calls (`market_status`, `sector_view(warm=True)`)
+Ask it who holds AAPL and you get the top holder addresses with their share of total supply, flagged contract or wallet. One holder contract turns out to sit on 35% of NVDA; that is the kind of concentration risk a quote page will never show you.
+
+`wallet_holdings` reads any address across all 194 equities and values the positions it has fresh quotes for. `transfer_history` walks recent ERC-20 Transfers with a `min_value` filter, which is how you catch the large prints instead of the dust.
+
+Prices are the trap here, so they ship split-safe: raw and multiplier-adjusted values travel together on every quote, and a pending split (NVDA queues a 4.0 multiplier for 2026-11) comes with a warning and the effective time. A morning scan of market health, halted tokens and 13-sector averages costs two cheap calls.
 
 Full walkthroughs with real outputs: [examples/use-cases.md](examples/use-cases.md).
 
@@ -63,7 +58,7 @@ args = ["arcus-agent-gateway"]
 </details>
 
 <details>
-<summary><b>ZCode</b> — register the server and copy the agent skill (copy-paste)</summary>
+<summary><b>ZCode</b>: register the server and copy the agent skill</summary>
 
 ```bash
 # 1) start the gateway (keep it running)
@@ -84,11 +79,11 @@ PY
 # 3) copy the agent skill (tool guide + watchlist cron recipe)
 git clone -q --depth 1 https://github.com/alekskram/arcus-agent-gateway /tmp/aag
 cp -r /tmp/aag/.agents/skills/arcus-gateway ~/.zcode/skills/ && rm -rf /tmp/aag
-echo "ZCode setup done — restart your session and call any arcus tool"
+echo "ZCode setup done, restart your session and call any arcus tool"
 ```
 </details>
 
-Hosted form — streamable HTTP on port **8902**:
+Hosted form, streamable HTTP on port **8902**:
 
 ```bash
 uvx arcus-agent-gateway --http               # 127.0.0.1:8902
@@ -104,7 +99,7 @@ parameters are exactly as registered by `arcus_mcp/server.py`.
 |---|------|-----------|--------------|
 | 1 | `token_list` | `token_list(status="ACTIVE", limit=100)` | Tokenized equities, one row per token (symbol, name, status, multiplier, tradable); `status` filters the `ASSET_STATUS_*` prefix, `'ALL'` disables. Start here for valid symbols. |
 | 2 | `quote` | `quote(symbol)` | Live quote joined with asset metadata: raw + multiplier-adjusted bid/ask/spread, `is_halted`, trading capabilities, multiplier block. Unknown symbol raises with a pointer to `token_list()`. |
-| 3 | `quotes` | `quotes(symbols)` | Batch of `quote()` rows, **max 20 per call** (more raises). Unknown symbols land in `errors` without failing the batch. Requests run in parallel (semaphore 8) — 10 cold symbols ≈ 0.6–1 s instead of ~3 s. |
+| 3 | `quotes` | `quotes(symbols)` | Batch of `quote()` rows, **max 20 per call** (more raises). Unknown symbols land in `errors` without failing the batch. Requests run in parallel (semaphore 8); 10 cold symbols take 0.6-1 s instead of ~3 s. |
 | 4 | `token_detail` | `token_detail(symbol)` | Full dossier: contract/chain/ISIN metadata, embedded quote, last 5 corporate actions, multiplier block with history note, `warnings` (pending split). |
 | 5 | `market_status` | `market_status()` | Market-wide health from assets only (never fetches 194 prices): totals, untradable count, cached-halted list, extended-hours estimate. |
 | 6 | `corporate_actions` | `corporate_actions(symbol=None, limit=10)` | Splits/dividends across all tokens or for one symbol; tolerant to the API's field-name variants. |
@@ -114,12 +109,12 @@ parameters are exactly as registered by `arcus_mcp/server.py`.
 | 10 | `price_history` | `price_history(symbol, timeframe="daily", limit=90)` | OHLCV history from the optional recorder's local parquet store (see below). Honest degradation: missing pyarrow or data → actionable `error` dict, never a silent empty list. |
 | 11 | `holder_snapshot` | `holder_snapshot(symbol, limit=20)` | Top holders of a token's contract from the Blockscout explorer (one page, max 50 rows, 600 s cache). Rows: `address`, `value` (float token units), `share_pct` = value / total_supply × 100, `is_contract`. `total_supply` from the RPC with an explorer fallback (source-tagged); no supply at all → `share_pct: null` + warning. Errors → `error` dict with `kind` + `hint`. |
 | 12 | `wallet_holdings` | `wallet_holdings(address)` | Which of the 194 tokenized equities a wallet holds (explorer `token-balances` ∩ `assets()` universe). Rows: `symbol`, `name`, `value` (float token units). `est_position_usd` / `portfolio_usd_total` computed ONLY from quotes already in the price cache (no fan-out); missing/stale quotes → `null` estimates + explanatory note. Cached 120 s. |
-| 13 | `transfer_history` | `transfer_history(symbol, limit=25, min_value=None)` | Recent ERC-20 `Transfer` events from the public RPC's adaptive walk-back (windows start 48 blocks wide, shrink 48→32→16→8 on archive 403s, ≤14 getLogs requests — see [On-chain sources & limits](#on-chain-sources--limits)). Rows (newest first): `ts` (ISO, from the log's own `blockTimestamp`), `from`, `to`, `value` (float), `tx_hash`, `block`. `min_value` filters in token units; window exhausted with 0 logs → explicit note pointing at the explorer. Cached 60 s. |
-| — | *watchlist* | — | Not a tool. Price tracking is done by your agent's scheduler (cron) calling `quotes()` on an interval — see [`.agents/skills/arcus-gateway/SKILL.md`](.agents/skills/arcus-gateway/SKILL.md). |
+| 13 | `transfer_history` | `transfer_history(symbol, limit=25, min_value=None)` | Recent ERC-20 `Transfer` events from the public RPC's adaptive walk-back (windows start 48 blocks wide, shrink 48→32→16→8 on archive 403s, ≤14 getLogs requests — (see [On-chain sources & limits](#on-chain-sources--limits))). Rows (newest first): `ts` (ISO, from the log's own `blockTimestamp`), `from`, `to`, `value` (float), `tx_hash`, `block`. `min_value` filters in token units; window exhausted with 0 logs → explicit note pointing at the explorer. Cached 60 s. |
+| — | *watchlist* | — | Not a tool. Price tracking is done by your agent's scheduler (cron) calling `quotes()` on an interval — (see [`.agents/skills/arcus-gateway/SKILL.md`](.agents/skills/arcus-gateway/SKILL.md)). |
 
 ## Multiplier logic (read this before using prices)
 
-Robinhood Chain tokens carry a **multiplier** — the corporate-action
+Robinhood Chain tokens carry a **multiplier**, the corporate-action
 adjustment factor for the token contract (`1.0` = untouched). Splits change it;
 for example NVDA's 2026-11 split queues `pendingMultiplier: "4.0"`.
 
@@ -129,7 +124,7 @@ for example NVDA's 2026-11 split queues `pendingMultiplier: "4.0"`.
   `price_adjusted = round(price_raw × currentMultiplier, 6)`.
 - **Raw and adjusted always travel together.** Every quote carries
   `bid_raw`/`ask_raw`/`spread_raw` *and* `bid_adjusted`/`ask_adjusted`/
-  `mid_adjusted` next to the `multiplier` block — never one without the other.
+  `mid_adjusted` next to the `multiplier` block, never one without the other.
 - On-chain quantities (token balances, mint/burn volumes) are natively in
   adjusted (multiplied) units; REST prices are not. If you compare the two,
   go through the `*_adjusted` fields.
@@ -147,12 +142,12 @@ AAPL   currentMultiplier = 1.000566080061092436
 differs from the current one, `token_detail()` adds a warning like
 `pending split: 1→4.0 on 2026-11-06T00:00:00Z`, and `quote()`'s multiplier
 block exposes `pending` + `effective_time`. After the split lands, raw prices
-jump by the ratio while `*_adjusted` fields stay comparable — another reason to
+jump by the ratio while `*_adjusted` fields stay comparable, another reason to
 always read adjusted values next to the multiplier.
 
 ## Why a gateway and not the raw API?
 
-`api.robinhood.com/rhj` + the public RPC are open — and every agent hitting them directly rediscovers the same traps:
+`api.robinhood.com/rhj` + the public RPC are open, and every agent hitting them directly rediscovers the same traps:
 
 | Raw sources give you | You would have to build |
 |---|---|
@@ -160,7 +155,7 @@ always read adjusted values next to the multiplier.
 | no price history endpoint at all | a recorder (opt-in here): 5-min snapshots → parquet → idempotent daily OHLCV rollup |
 | 60 req/s upstream limit | a polite rate-limited client (≤50 req/s), per-endpoint caches, parallel batched quotes |
 | RPC archive window that 403s outside ~45–60 blocks behind head | adaptive walk-back (48→32→16→8 block windows, ≤14 getLogs) |
-| a Blockscout explorer behind a Cloudflare UA check, 40 s hangs on contract wallets | browser UA, timeouts, honest `error`/`warnings[]` degradation — never a silent empty list |
+| a Blockscout explorer behind a Cloudflare UA check, 40 s hangs on contract wallets | browser UA, timeouts, honest `error`/`warnings[]` degradation, never a silent empty list |
 
 ## API limits & caching
 
@@ -170,24 +165,24 @@ always read adjusted values next to the multiplier.
   times with `2s × (attempt+1)` backoff.
 - Response caches (per process): `/assets` **5 min**, `/prices/{symbol}`
   **15 s**, `/corporate-actions` **1 h**. `market_status()` and `sector_view()`
-  are computed from caches and assets only — they never fan out 194 price
+  are computed from caches and assets only; they never fan out 194 price
   requests.
 
 ## On-chain sources & limits
 
 The v0.2 on-chain tools read **two keyless public sources** next to the REST
-API. Both are free, rate-limited and partially restricted — every tool above
+API. Both are free, rate-limited and partially restricted. Every tool above
 degrades honestly (per-field omission + `warnings[]` / `error` dicts), never
 with a silent empty answer.
 
 - **Public JSON-RPC** (default `robinhood-rpc.publicnode.com`, override with
   `ARCUS_RPC_URL`): `eth_call` (e.g. `totalSupply()`) works normally.
   **`eth_getLogs` only answers inside a floating ~45–60-block window behind
-  the latest block** — wider or older ranges get HTTP 403 "Archive requests
+  the latest block**; wider or older ranges get HTTP 403 "Archive requests
   require a personal token" (the backend is Alchemy). The window drifts
   minute to minute, so `transfer_history()` walks back in windows that start
   48 blocks wide and shrink 48→32→16→8 on each 403, capped at ~14 getLogs
-  requests. `eth_getLogs` log objects carry `blockTimestamp` directly — no
+  requests. `eth_getLogs` log objects carry `blockTimestamp` directly, so no
   per-block lookups are needed.
 - **Fallback RPC** (`robinhood.drpc.org`, `ARCUS_RPC_FALLBACK_URL`): has
   **no `eth_getLogs` and no `eth_call`** (JSON-RPC "method not available");
@@ -195,7 +190,7 @@ with a silent empty answer.
 - **Blockscout v2 explorer** (`robinhoodchain.blockscout.com/api/v2`,
   `ARCUS_EXPLORER_URL`): requires a browser User-Agent on every request,
   and since Sep 2026 also passes Cloudflare's **TLS-fingerprint** bot
-  management — a plain client gets 403 even with browser headers. The
+  management, so a plain client gets 403 even with browser headers. The
   gateway retries every Cloudflare 403 once with curl_cffi Chrome
   impersonation when the optional extra is installed:
   `pip install "arcus-agent-gateway[browser]"`. Without it, the two
@@ -205,7 +200,7 @@ with a silent empty answer.
   Token pages (`holders_count`, `circulating_market_cap`, `total_supply`),
   one holders page (max 50 rows, no pagination loops) and address
   `token-balances` come from here, cached 600 s. `token-balances` answers in
-  ~0.5 s on plain wallets but **hangs 40 s+ on huge contract addresses** —
+  ~0.5 s on plain wallets but **hangs 40 s+ on huge contract addresses**, and
   the client fails honestly after 15 s with kind `explorer-timeout`.
 - **On-chain activity ≠ trades.** The chain records `Transfer`, mint and
   redeem events between addresses; it knows nothing about order-book trades
@@ -214,7 +209,7 @@ with a silent empty answer.
 
 ## Raw prices disclaimer
 
-Prices are served **exactly as they arrive from Robinhood (RAW)** — they are
+Prices are served **exactly as they arrive from Robinhood (RAW)**; they are
 *not* multiplier-adjusted, and the `*_adjusted` fields are **our computation**,
 not upstream data. All data is for information only, **not for trading
 decisions**, and should be verified against the official source before you act
@@ -222,7 +217,7 @@ on it. No warranty of completeness, accuracy or timeliness.
 
 ## Optional price history recorder
 
-The Robinhood Chain REST API has **no price history endpoint** — only current
+The Robinhood Chain REST API has **no price history endpoint**, only current
 quotes. For the 194 tokenized equities this recorder is the only history
 source. It is **opt-in and disabled by default**; nothing is recorded unless
 you explicitly enable it.
@@ -254,13 +249,13 @@ ARCUS_INTERVAL_SEC=60 python -m arcus_mcp.recorder  # custom interval loop
 **Data weight & rotation.** Full universe (194 symbols) at a 5-minute tick ≈
 **2–3 MB/day** of snapshots plus ≈ 10 KB/day for the daily rollup. Snapshots
 rotate monthly (`snapshots_YYYYMM.parquet`); delete old months when you no
-longer need raw granularity — `daily.parquet` is the compact long-term store.
+longer need raw granularity. `daily.parquet` is the compact long-term store.
 Data lands in `~/.local/state/arcus-agent-gateway/history/` (override with
 `ARCUS_GATEWAY_DATA`).
 
 **Reading it back:** the `price_history` tool serves `daily` bars and `raw`
 snapshots from the same directory. Without pyarrow or data it returns an
-actionable error pointing here — install the `[recorder]` extra, never a
+actionable error pointing here: install the `[recorder]` extra, never a
 silent empty answer.
 
 ## Security & privacy
@@ -276,7 +271,7 @@ silent empty answer.
 
 ## Part of the suite
 
-Four sibling read-only MCP gateways, one style — keyless, cached, honest degradation:
+Four sibling read-only MCP gateways, one style: keyless, cached, honest degradation.
 
 | Gateway | Focus |
 |---|---|
@@ -285,8 +280,8 @@ Four sibling read-only MCP gateways, one style — keyless, cached, honest degra
 | [hyperliquid-agent-gateway](https://github.com/alekskram/hyperliquid-agent-gateway) | Hyperliquid: 233 perps + spot, funding carry, account risk, HyperEVM |
 | [aster-agent-gateway](https://github.com/alekskram/aster-agent-gateway) | Aster DEX: ~580 futures incl. 24/7 TradFi perps, funding caps/floors |
 
-All four are on [glama.ai](https://glama.ai/mcp/servers/alekskram/arcus-agent-gateway) and PyPI — install any of them with `uvx <name>`.
+All four are on [glama.ai](https://glama.ai/mcp/servers/alekskram/arcus-agent-gateway) and PyPI; any of them installs with `uvx <name>`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Not affiliated with Robinhood Markets, Inc.
+MIT, see [LICENSE](LICENSE). Not affiliated with Robinhood Markets, Inc.
